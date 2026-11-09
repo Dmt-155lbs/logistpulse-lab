@@ -1,0 +1,5 @@
+target
+.git
+.devcontainer
+docs
+*.md

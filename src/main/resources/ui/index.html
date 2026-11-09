@@ -1,0 +1,129 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<title>LOGISTPULSE Lab</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  :root { --bg:#0f172a; --card:#1e293b; --fg:#e2e8f0; --mut:#94a3b8; --ok:#22c55e; --warn:#f59e0b; --bad:#ef4444; --acc:#38bdf8; }
+  * { box-sizing: border-box; }
+  body { margin:0; font:14px/1.45 system-ui,sans-serif; background:var(--bg); color:var(--fg); }
+  header { padding:14px 20px; border-bottom:1px solid #334155; display:flex; gap:16px; align-items:baseline; flex-wrap:wrap; }
+  header h1 { margin:0; font-size:18px; } header a { color:var(--acc); text-decoration:none; font-size:13px; }
+  main { display:grid; grid-template-columns:minmax(320px,1fr) minmax(380px,1.3fr); gap:16px; padding:16px 20px; }
+  @media (max-width:900px){ main{grid-template-columns:1fr;} }
+  section { background:var(--card); border-radius:10px; padding:14px; }
+  h2 { margin:0 0 10px; font-size:14px; color:var(--mut); text-transform:uppercase; letter-spacing:.05em; }
+  canvas { width:100%; background:#0b1220; border-radius:6px; cursor:crosshair; }
+  table { width:100%; border-collapse:collapse; } th,td { text-align:left; padding:5px 6px; border-bottom:1px solid #334155; font-size:13px; }
+  th { color:var(--mut); font-weight:600; }
+  button { background:#334155; color:var(--fg); border:0; border-radius:5px; padding:3px 8px; cursor:pointer; font-size:12px; }
+  button:hover { background:#475569; } button.p { background:var(--acc); color:#082f49; }
+  .tag { padding:1px 7px; border-radius:99px; font-size:11px; background:#334155; }
+  .CREATED{background:#475569}.DISPATCHED{background:#0369a1}.IN_TRANSIT{background:#b45309}.DELIVERED{background:#15803d}.CANCELLED{background:#991b1b}
+  .IDLE{background:#15803d}.BUSY{background:#b45309}
+  #msg { margin-top:8px; min-height:18px; color:var(--mut); } .err { color:var(--bad) !important; }
+  form { display:flex; gap:6px; flex-wrap:wrap; margin-bottom:10px; } input { background:#0b1220; color:var(--fg); border:1px solid #334155; border-radius:5px; padding:4px 7px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>LOGISTPULSE Lab</h1>
+  <a href="/actuator/health" target="_blank">health</a>
+  <a href="/actuator/prometheus" target="_blank">métricas</a>
+  <a href="/api/orders" target="_blank">/api/orders</a>
+  <span id="msg"></span>
+</header>
+<main>
+  <div style="display:grid;gap:16px;align-content:start">
+    <section>
+      <h2>Almacén · ruta A* (clic en una celda destino)</h2>
+      <canvas id="cv"></canvas>
+      <div id="route" style="color:var(--mut);margin-top:6px">Origen (0,0). Gris oscuro: estantería · ámbar: congestionado (costo 5).</div>
+    </section>
+    <section>
+      <h2>Flota AMR</h2>
+      <table><thead><tr><th>Código</th><th>Estado</th><th>Batería</th><th></th></tr></thead><tbody id="robots"></tbody></table>
+    </section>
+  </div>
+  <section>
+    <h2>Pedidos</h2>
+    <form id="f">
+      <input name="customer" placeholder="Cliente" required>
+      <input name="destX" type="number" min="0" placeholder="x" style="width:60px" required>
+      <input name="destY" type="number" min="0" placeholder="y" style="width:60px" required>
+      <button class="p">Crear pedido</button>
+    </form>
+    <table><thead><tr><th>#</th><th>Código</th><th>Cliente</th><th>Dest.</th><th>Estado</th><th>AMR</th><th>ETA</th><th>Acciones</th></tr></thead><tbody id="orders"></tbody></table>
+  </section>
+</main>
+<script>
+const $ = s => document.querySelector(s), CELL = 40;
+let grid = null, path = [], orders = [];
+const msg = (t, bad) => { const m=$('#msg'); m.textContent=t||''; m.className=bad?'err':''; };
+
+async function api(url, opt) {
+  const r = await fetch(url, opt && { headers:{'Content-Type':'application/json'}, ...opt });
+  const body = r.status === 204 ? null : await r.json().catch(() => null);
+  if (!r.ok) throw new Error((body && body.error) || ('HTTP ' + r.status));
+  return body;
+}
+
+function draw() {
+  const cv = $('#cv'); if (!grid) return;
+  cv.width = grid.width * CELL; cv.height = grid.height * CELL;
+  const g = cv.getContext('2d');
+  grid.rows.forEach((row, y) => [...row].forEach((c, x) => {
+    g.fillStyle = c === '#' ? '#334155' : c === ',' ? '#78350f' : '#0f1b2d';
+    g.fillRect(x*CELL+1, y*CELL+1, CELL-2, CELL-2);
+  }));
+  orders.filter(o => !['DELIVERED','CANCELLED'].includes(o.status)).forEach(o => {
+    g.fillStyle = '#a78bfa'; g.fillRect(o.destX*CELL+14, o.destY*CELL+14, 12, 12);
+  });
+  if (path.length) {
+    g.strokeStyle = '#38bdf8'; g.lineWidth = 4; g.beginPath(); g.moveTo(CELL/2, CELL/2);
+    path.forEach(p => g.lineTo(p.x*CELL+CELL/2, p.y*CELL+CELL/2)); g.stroke();
+  }
+  g.fillStyle = '#22c55e'; g.beginPath(); g.arc(CELL/2, CELL/2, 9, 0, 7); g.fill();
+}
+
+$('#cv').addEventListener('click', async e => {
+  const r = e.target.getBoundingClientRect();
+  const x = Math.floor((e.clientX - r.left) / r.width * grid.width);
+  const y = Math.floor((e.clientY - r.top) / r.height * grid.height);
+  try {
+    const rt = await api(`/api/routes?fromX=0&fromY=0&toX=${x}&toY=${y}`);
+    path = rt.path; $('#route').textContent = `(0,0) → (${x},${y}): ${rt.steps} pasos, costo ${rt.cost}`; msg();
+  } catch (err) { path = []; msg(err.message, true); }
+  draw();
+});
+
+async function load() {
+  const [rb, od] = await Promise.all([api('/api/robots'), api('/api/orders?size=20')]);
+  orders = od.content;
+  $('#robots').innerHTML = rb.map(r => `<tr><td>${r.code}</td><td><span class="tag ${r.status}">${r.status}</span></td><td>${r.battery}%</td>
+    <td><button onclick="act('/api/robots/${r.id}/charge')">cargar</button></td></tr>`).join('');
+  $('#orders').innerHTML = orders.map(o => `<tr><td>${o.id}</td><td>${o.code}</td><td>${o.customer}</td><td>(${o.destX},${o.destY})</td>
+    <td><span class="tag ${o.status}">${o.status}</span></td><td>${o.robot ?? '—'}</td><td>${o.etaMinutes ?? '—'}</td>
+    <td>${Object.keys(o.links).filter(k => k==='dispatch' || k.startsWith('to-')).map(k => k==='dispatch'
+      ? `<button class="p" onclick="act('${o.links.dispatch}')">despachar</button>`
+      : `<button onclick="act('${o.links[k]}', {to:'${k.slice(3).toUpperCase()}'})">${k.slice(3)}</button>`).join(' ')}</td></tr>`).join('');
+  draw();
+}
+
+async function act(url, body) {
+  try { await api(url, { method:'POST', body: body ? JSON.stringify(body) : undefined }); msg('OK'); }
+  catch (e) { msg(e.message, true); }
+  load();
+}
+
+$('#f').addEventListener('submit', async e => {
+  e.preventDefault(); const f = new FormData(e.target);
+  await act('/api/orders', { customer: f.get('customer'), destX: +f.get('destX'), destY: +f.get('destY') });
+  e.target.reset();
+});
+
+(async () => { grid = await api('/api/routes/grid'); await load(); setInterval(load, 4000); })().catch(e => msg(e.message, true));
+</script>
+</body>
+</html>

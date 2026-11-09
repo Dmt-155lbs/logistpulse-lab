@@ -1,0 +1,28 @@
+{
+  "name": "LOGISTPULSE Lab",
+  "image": "mcr.microsoft.com/devcontainers/base:ubuntu",
+  "features": {
+    "ghcr.io/devcontainers/features/java:1": { "version": "21", "installMaven": "true" },
+    "ghcr.io/devcontainers/features/docker-in-docker:2": {}
+  },
+  "hostRequirements": { "cpus": 4 },
+  "forwardPorts": [8080, 3000, 9090, 15672, 9091],
+  "portsAttributes": {
+    "8080": { "label": "API + consola LOGISTPULSE", "onAutoForward": "openBrowser" },
+    "3000": { "label": "Grafana" },
+    "9090": { "label": "Prometheus" },
+    "15672": { "label": "RabbitMQ (guest/guest)" },
+    "9091": { "label": "Transportista simulado (WireMock)" }
+  },
+  "postCreateCommand": "mvn -B -q dependency:go-offline || true",
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "vscjava.vscode-java-pack",
+        "vmware.vscode-boot-dev-pack",
+        "humao.rest-client",
+        "ms-azuretools.vscode-docker"
+      ]
+    }
+  }
+}

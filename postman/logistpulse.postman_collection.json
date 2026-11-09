@@ -1,0 +1,354 @@
+{
+  "info": {
+    "name": "LOGISTPULSE Lab",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "variable": [
+    {
+      "key": "host",
+      "value": "http://localhost:8080"
+    },
+    {
+      "key": "orderId",
+      "value": "1"
+    }
+  ],
+  "item": [
+    {
+      "name": "Health",
+      "request": {
+        "method": "GET",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "url": {
+          "raw": "{{host}}/actuator/health",
+          "host": [
+            "{{host}}"
+          ],
+          "path": [
+            "actuator",
+            "health"
+          ]
+        }
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('200', () => pm.response.to.have.status(200));"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "Robots",
+      "request": {
+        "method": "GET",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "url": {
+          "raw": "{{host}}/api/robots",
+          "host": [
+            "{{host}}"
+          ],
+          "path": [
+            "api",
+            "robots"
+          ]
+        }
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('200', () => pm.response.to.have.status(200));"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "Grid",
+      "request": {
+        "method": "GET",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "url": {
+          "raw": "{{host}}/api/routes/grid",
+          "host": [
+            "{{host}}"
+          ],
+          "path": [
+            "api",
+            "routes",
+            "grid"
+          ]
+        }
+      }
+    },
+    {
+      "name": "Ruta (0,0)->(11,7)",
+      "request": {
+        "method": "GET",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "url": {
+          "raw": "{{host}}/api/routes?fromX=0&fromY=0&toX=11&toY=7",
+          "host": [
+            "{{host}}"
+          ],
+          "path": [
+            "api",
+            "routes"
+          ],
+          "query": [
+            {
+              "key": "fromX",
+              "value": "0"
+            },
+            {
+              "key": "fromY",
+              "value": "0"
+            },
+            {
+              "key": "toX",
+              "value": "11"
+            },
+            {
+              "key": "toY",
+              "value": "7"
+            }
+          ]
+        }
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('hay pasos', () => pm.expect(pm.response.json().steps).to.be.above(0));"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "Ruta bloqueada (422)",
+      "request": {
+        "method": "GET",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "url": {
+          "raw": "{{host}}/api/routes?fromX=0&fromY=0&toX=1&toY=1",
+          "host": [
+            "{{host}}"
+          ],
+          "path": [
+            "api",
+            "routes"
+          ],
+          "query": [
+            {
+              "key": "fromX",
+              "value": "0"
+            },
+            {
+              "key": "fromY",
+              "value": "0"
+            },
+            {
+              "key": "toX",
+              "value": "1"
+            },
+            {
+              "key": "toY",
+              "value": "1"
+            }
+          ]
+        }
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('422', () => pm.response.to.have.status(422));"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "Listar pedidos",
+      "request": {
+        "method": "GET",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "url": {
+          "raw": "{{host}}/api/orders?page=0&size=5",
+          "host": [
+            "{{host}}"
+          ],
+          "path": [
+            "api",
+            "orders"
+          ],
+          "query": [
+            {
+              "key": "page",
+              "value": "0"
+            },
+            {
+              "key": "size",
+              "value": "5"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "Crear pedido",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "url": {
+          "raw": "{{host}}/api/orders",
+          "host": [
+            "{{host}}"
+          ],
+          "path": [
+            "api",
+            "orders"
+          ]
+        },
+        "body": {
+          "mode": "raw",
+          "raw": "{\"customer\": \"Postman\", \"destX\": 10, \"destY\": 5}"
+        }
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('201', () => pm.response.to.have.status(201));",
+              "pm.test('Location', () => pm.expect(pm.response.headers.get('Location')).to.include('/api/orders/'));",
+              "pm.collectionVariables.set('orderId', pm.response.json().id);"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "Despachar pedido creado",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "url": {
+          "raw": "{{host}}/api/orders/{{orderId}}/dispatch",
+          "host": [
+            "{{host}}"
+          ],
+          "path": [
+            "api",
+            "orders",
+            "{{orderId}}",
+            "dispatch"
+          ]
+        }
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('200 o 409 sin AMR', () => pm.expect([200,409]).to.include(pm.response.code));"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "Saltar estados (409)",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "url": {
+          "raw": "{{host}}/api/orders/{{orderId}}/transitions",
+          "host": [
+            "{{host}}"
+          ],
+          "path": [
+            "api",
+            "orders",
+            "{{orderId}}",
+            "transitions"
+          ]
+        },
+        "body": {
+          "mode": "raw",
+          "raw": "{\"to\": \"DELIVERED\"}"
+        }
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('409', () => pm.response.to.have.status(409));"
+            ]
+          }
+        }
+      ]
+    }
+  ]
+}

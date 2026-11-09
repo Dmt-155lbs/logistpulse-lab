@@ -1,0 +1,35 @@
+{
+  "mappings": [
+    {
+      "name": "ETA lento (para probar timeouts): códigos LP-SLOW*",
+      "priority": 1,
+      "request": {
+        "method": "GET",
+        "urlPath": "/carrier/eta",
+        "queryParameters": { "code": { "matches": "LP-SLOW.*" } }
+      },
+      "response": {
+        "status": 200,
+        "fixedDelayMilliseconds": 5000,
+        "headers": { "Content-Type": "application/json" },
+        "jsonBody": { "code": "{{request.query.code}}", "etaMinutes": 99 },
+        "transformers": ["response-template"]
+      }
+    },
+    {
+      "name": "ETA normal",
+      "priority": 5,
+      "request": {
+        "method": "GET",
+        "urlPath": "/carrier/eta"
+      },
+      "response": {
+        "status": 200,
+        "fixedDelayMilliseconds": 120,
+        "headers": { "Content-Type": "application/json" },
+        "jsonBody": { "code": "{{request.query.code}}", "etaMinutes": 25 },
+        "transformers": ["response-template"]
+      }
+    }
+  ]
+}

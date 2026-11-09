@@ -1,0 +1,47 @@
+{
+  "uid": "logistpulse-ops",
+  "title": "LOGISTPULSE · Operaciones",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "5s",
+  "time": { "from": "now-15m", "to": "now" },
+  "panels": [
+    {
+      "id": 1, "type": "timeseries", "title": "Pedidos despachados / min",
+      "gridPos": { "x": 0, "y": 0, "w": 12, "h": 8 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [ { "refId": "A", "expr": "rate(logistpulse_orders_dispatched_total[1m]) * 60", "legendFormat": "despachados" },
+                   { "refId": "B", "expr": "rate(logistpulse_orders_created_total[1m]) * 60", "legendFormat": "creados" } ]
+    },
+    {
+      "id": 2, "type": "stat", "title": "AMR libres",
+      "gridPos": { "x": 12, "y": 0, "w": 6, "h": 8 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [ { "refId": "A", "expr": "logistpulse_robots_idle" } ]
+    },
+    {
+      "id": 3, "type": "stat", "title": "AMR en misión",
+      "gridPos": { "x": 18, "y": 0, "w": 6, "h": 8 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [ { "refId": "A", "expr": "logistpulse_robots_busy" } ]
+    },
+    {
+      "id": 4, "type": "timeseries", "title": "Cálculos A* (cache-miss) / min",
+      "gridPos": { "x": 0, "y": 8, "w": 12, "h": 8 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [ { "refId": "A", "expr": "rate(logistpulse_route_plan_seconds_count[1m]) * 60", "legendFormat": "cálculos reales" } ]
+    },
+    {
+      "id": 5, "type": "timeseries", "title": "HTTP: peticiones/s por estado",
+      "gridPos": { "x": 12, "y": 8, "w": 12, "h": 8 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [ { "refId": "A", "expr": "sum by (status) (rate(http_server_requests_seconds_count[1m]))", "legendFormat": "{{status}}" } ]
+    },
+    {
+      "id": 6, "type": "timeseries", "title": "JVM heap usado (MB)",
+      "gridPos": { "x": 0, "y": 16, "w": 12, "h": 8 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [ { "refId": "A", "expr": "sum(jvm_memory_used_bytes{area=\"heap\"}) / 1024 / 1024", "legendFormat": "heap" } ]
+    }
+  ]
+}

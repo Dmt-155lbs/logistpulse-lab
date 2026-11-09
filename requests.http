@@ -1,0 +1,75 @@
+### Cliente REST: extensión "REST Client" (humao.rest-client) en VS Code / Codespaces.
+### Cambia @host si tu puerto no es 8080.
+@host = http://localhost:8080
+
+### Salud
+GET {{host}}/actuator/health
+
+### Flota
+GET {{host}}/api/robots
+
+### Plano del almacén
+GET {{host}}/api/routes/grid
+
+### Ruta A* de (0,0) a (11,7)
+GET {{host}}/api/routes?fromX=0&fromY=0&toX=11&toY=7
+
+### Ruta a una celda bloqueada -> 422
+GET {{host}}/api/routes?fromX=0&fromY=0&toX=1&toY=1
+
+### Pedidos paginados (con enlaces HATEOAS)
+GET {{host}}/api/orders?page=0&size=2
+
+### Filtrar por estado
+GET {{host}}/api/orders?status=CREATED
+
+### Crear pedido
+POST {{host}}/api/orders
+Content-Type: application/json
+
+{ "customer": "Tiendas Tía Cumbayá", "destX": 10, "destY": 5 }
+
+### Validación -> 400 (cliente vacío)
+POST {{host}}/api/orders
+Content-Type: application/json
+
+{ "customer": "", "destX": 3, "destY": 0 }
+
+### Despachar el pedido 1 (asigna AMR, calcula ruta y ETA)
+POST {{host}}/api/orders/1/dispatch
+
+### Despachar otra vez -> 409 (transición ilegal)
+POST {{host}}/api/orders/1/dispatch
+
+### Pasar a IN_TRANSIT (en modo docker lo hace solo el consumidor de RabbitMQ)
+POST {{host}}/api/orders/1/transitions
+Content-Type: application/json
+
+{ "to": "IN_TRANSIT" }
+
+### Entregar
+POST {{host}}/api/orders/1/transitions
+Content-Type: application/json
+
+{ "to": "DELIVERED" }
+
+### Saltarse estados -> 409
+POST {{host}}/api/orders/2/transitions
+Content-Type: application/json
+
+{ "to": "DELIVERED" }
+
+### Pedido con transportista lento (WireMock tarda 5 s; el cliente corta a los 2 s y degrada)
+POST {{host}}/api/orders
+Content-Type: application/json
+
+{ "code": "LP-SLOW1", "customer": "Prueba timeout", "destX": 5, "destY": 3 }
+
+###
+POST {{host}}/api/orders/4/dispatch
+
+### Cargar batería del robot 5
+POST {{host}}/api/robots/5/charge
+
+### Métricas Prometheus
+GET {{host}}/actuator/prometheus
