@@ -160,3 +160,74 @@ Detalle: la transición a `DISPATCHED` no aparece como `to-dispatched` porque se
 
 ### Reto: ¿por qué limitar `size` a 100 en el servicio y no solo en el recurso?
 El recurso es solo una de las puertas de entrada: el servicio puede ser invocado desde otros llamadores (otro recurso, un listener de mensajes, un job programado, tests). La regla "nunca se carga más de 100 filas por consulta" es una protección de recursos del sistema (memoria, tiempo de consulta, tamaño de la respuesta, y en el caso de N+1 el número de consultas), no un detalle del protocolo HTTP; por eso debe vivir donde se aplica la lógica de negocio y no depender de que cada capa de entrada se acuerde de validarla. Un `size=100000` sin límite cargaría todas las filas en memoria en una sola petición (DoS accidental o malicioso). Además un recurso podría cambiar o duplicarse y perder el límite. Lo comprueba `OrderServiceListTest.limitaElTamanoDePaginaA100`, que invoca al servicio directamente sin pasar por HTTP, y la prueba real con `?size=100000` devolvió `size: 100`.
+
+## Parte 4 · Máquina de estados y concurrencia
+
+### Qué se implementó
+- `domain/OrderStatus.java`: nuevo estado `RETURNED`; `DELIVERED -> {RETURNED}`; `RETURNED` y `CANCELLED` son terminales.
+- `OrderResource.linked()` **no necesitó cambios**: genera los enlaces recorriendo `status.next()`, así que `DELIVERED` ofrece ahora `to-returned` y `RETURNED` solo `self`/`collection` (ventaja de derivar HATEOAS de la máquina de estados).
+- `service/OrderService.transition`: `RETURNED` pasa por la validación genérica. **Decisión sobre el robot: no se toca.** Al marcar `DELIVERED` el AMR ya quedó `IDLE` (y se le descontó la batería); una devolución es un trámite del cliente, no una misión del AMR. El pedido conserva `robot` solo como histórico. Liberarlo o reasignarlo aquí podría pisar una misión posterior del mismo AMR. (Si la devolución exigiera recogida física habría que modelarla como otra misión con su propio despacho.)
+- `ui/index.html`: color de la etiqueta `RETURNED` y se excluye de los destinos pendientes dibujados en el plano. Los botones de acción salen de los `links`, así que el botón "returned" aparece en los pedidos `DELIVERED` sin más cambios.
+- `OrderStatusTest`: de 4 a 9 casos (5 nuevos): `DELIVERED -> RETURNED` permitido y único destino; **solo** `DELIVERED` puede ir a `RETURNED` (recorre todo el enum); `RETURNED` es terminal; `DELIVERED` no puede cancelarse ni retroceder; `RETURNED` es inalcanzable desde `CREATED/DISPATCHED/IN_TRANSIT/CANCELLED`.
+
+```mermaid
+stateDiagram-v2
+    [*] --> CREATED
+    CREATED --> DISPATCHED
+    CREATED --> CANCELLED
+    DISPATCHED --> IN_TRANSIT
+    DISPATCHED --> CANCELLED
+    IN_TRANSIT --> DELIVERED
+    DELIVERED --> RETURNED
+    RETURNED --> [*]
+    CANCELLED --> [*]
+```
+
+### Cómo se probó
+- `./mvnw test`: 25 tests, 0 fallos (9 en `OrderStatusTest`).
+- Flujo real (Modo A y luego Modo B): despachar -> `IN_TRANSIT` -> `DELIVERED` (enlaces: `self, collection, to-returned`) -> `RETURNED` (200, enlaces: `self, collection`). Después, `RETURNED -> CANCELLED` y `RETURNED -> DELIVERED` responden `409 {"error":"Transición ilegal RETURNED → ..."}`; `GET /api/orders?status=RETURNED` devuelve el pedido. El AMR permanece `IDLE`.
+- En Postgres el `CHECK orders_status_check` generado por Hibernate ya incluye `'RETURNED'` (comprobado con `pg_get_constraintdef`). **Ojo**: en una base **ya existente** (volumen con el esquema anterior) `ddl-auto=update` no modifica un `CHECK` existente, por lo que habría que borrar el volumen o migrar con SQL/Flyway (no lo probé; es razonamiento sobre el comportamiento de `update`).
+
+### ★ Concurrencia: dos despachos simultáneos del mismo pedido
+**1) El comando literal del enunciado** (`curl ... & curl ... & wait`), 4 repeticiones en Modo A (pedidos 2, 4, 5, 6): siempre `200` para el primero y `409 {"status":409,"error":"Transición ilegal DISPATCHED → DISPATCHED"}` para el segundo. Es decir, el segundo `curl` llegó cuando el primero ya había hecho commit y lo rechazó la máquina de estados, no el bloqueo optimista: arrancar dos procesos `curl` no es lo bastante simultáneo para demostrar nada sobre `@Version`. (Con los AMR agotados, las repeticiones 7-9 dieron `409 No hay AMR disponible` en ambos.)
+
+**2) Concurrencia real**: script Python (`scripts/race.py`) con `threading.Barrier` y dos conexiones HTTP ya abiertas, de modo que las dos peticiones salen a la vez. El log de la app mostró que **los dos hilos llegaron a la llamada al transportista**, es decir, ambos estaban dentro de su transacción habiendo leído el pedido aún `CREATED`.
+
+| Escenario | Rondas | Resultado (cada ronda) |
+|---|---|---|
+| Mismo pedido, 2 despachos (H2, Modo A) | 30 | 30/30: uno `200` (DISPATCHED con AMR), el otro `409 {"status":409,"error":"Conflicto de concurrencia, reintenta la operación"}` |
+| Mismo pedido, 2 despachos (Postgres, Modo B) | 30 | 30/30: igual |
+
+**Quién gana:** el primero que hace commit. Ambos leen `Order` con `version = v` y `Robot` con `version = w`; cada uno ejecuta al confirmar `UPDATE orders ... WHERE id=? AND version=v` y `UPDATE robot ... WHERE id=? AND version=w`. El segundo encuentra una `version` distinta (en Postgres espera al bloqueo de fila del primero y, al reevaluar el `WHERE`, actualiza 0 filas): Hibernate lanza `OptimisticLockException`, Spring la traduce a `ObjectOptimisticLockingFailureException` y `OptimisticLockMapper` la convierte en **409** con un mensaje de "reintenta". No hay 500 ni datos a medias: la transacción perdedora hace *rollback* completo (el robot no queda `BUSY` dos veces). Sin el mapper el cliente vería un 500: el mapper convierte una excepción de infraestructura en un contrato HTTP claro. No hubo diferencias entre H2 y Postgres.
+
+### ★ ¿Dos pedidos distintos pueden recibir el mismo AMR?
+Intento de provocarlo: se ocupan 3 de los 4 AMR elegibles (el quinto tiene 15 % de batería) con pedidos de relleno, y se lanzan simultáneamente `dispatch` de dos pedidos distintos A y B (40 rondas en H2 y 40 en Postgres, liberando los AMR entre rondas). En H2 quedaba exactamente un AMR elegible; en Postgres (donde el AMR-05 había sido cargado a 100 %) quedaban dos.
+
+**Resultado: 40/40 en H2 y 40/40 en Postgres: uno `200` con el AMR y el otro `409` «Conflicto de concurrencia».** Nunca hubo doble asignación.
+
+**Por qué no es posible hoy:** `Robot` **sí** tiene `@Version` (`domain/Robot.java`, con el comentario "evita que dos despachos concurrentes tomen el mismo robot") y `dispatch` hace `robot.setStatus(BUSY)` **dentro de la misma transacción** que modifica el pedido. Los dos hilos seleccionan el mismo robot (la consulta ordena por id y devuelve el menor libre) y ambos lo marcan `BUSY`; el `UPDATE robot ... WHERE version=?` solo lo gana uno, y el otro revierte también el cambio de su pedido. Aunque los pedidos sean filas distintas (no hay conflicto entre ellos), la fila compartida es el robot, y está versionada. Si `Robot` no tuviera `@Version` (o no se actualizara en esa transacción), ambos verían `IDLE`, escribirían filas distintas sin conflicto y **sí habría doble asignación**. No hizo falta ninguna corrección de código.
+
+Matices observados (no son fallos de seguridad):
+- **Vivacidad:** en Postgres con 2 AMR libres, dos pedidos simultáneos eligieron ambos al de menor id y uno recibió 409 aunque había otro AMR libre; el cliente debe reintentar. Mejoras posibles: `SELECT ... FOR UPDATE SKIP LOCKED` o reintento dentro del servicio.
+- La protección es **solo de aplicación**: depende de que todo escritor pase por JPA con `@Version`. Un `UPDATE` manual o una versión antigua de la app la saltan (ver tabla y demostración).
+
+### 4.3 Invariantes del sistema
+Esquema real en Postgres (`\d orders`, `\d robot`): `PRIMARY KEY`, `UNIQUE(code)`, `NOT NULL`, FK `orders.robot_id -> robot` y `orders.warehouse_id -> warehouse`, y los `CHECK` de enumeración (`orders_status_check`, `robot_status_check`). Nada más.
+
+| # | Invariante | ¿Quién la garantiza hoy? | ¿La garantiza la BD? |
+|---|---|---|---|
+| 1 | `status` pertenece al enum (CREATED … RETURNED) | Enum + `CHECK` generado por Hibernate | **Sí** (`UPDATE ... status='LOST'` falla: `violates check constraint "orders_status_check"`) |
+| 2 | `code` de pedido y de robot únicos | `existsByCode` + `UNIQUE` | **Sí** (`existsByCode` solo tiene carrera; el `UNIQUE` evita el duplicado, aunque sin mapper devolvería 500) |
+| 3 | Todo pedido y robot tienen almacén | `optional=false` | **Sí** (`NOT NULL` + FK) |
+| 4 | Un pedido solo avanza por transiciones legales | `OrderStatus.canGoTo` en el servicio | **No** (`UPDATE orders SET status='CREATED'` sobre un pedido avanzado es aceptado) |
+| 5 | Un AMR `BUSY` tiene **exactamente un** pedido `DISPATCHED/IN_TRANSIT` | Servicio + `@Version` en `Robot` | **No** |
+| 6 | Un AMR tiene **como máximo un** pedido activo | Servicio + `@Version` | **No**: en Postgres, `BEGIN; UPDATE orders SET status='DISPATCHED', robot_id=<AMR-04> WHERE id IN (1,2);` -> `UPDATE 2` (dos pedidos activos con el mismo AMR). Haría falta `CREATE UNIQUE INDEX ... ON orders(robot_id) WHERE status IN ('DISPATCHED','IN_TRANSIT')` |
+| 7 | `DISPATCHED/IN_TRANSIT` ⇒ `robot_id` y `eta_minutes` no nulos; `CREATED/CANCELLED` ⇒ `robot_id` nulo | Servicio | **No** (haría falta un `CHECK` entre columnas) |
+| 8 | `battery` entre 0 y 100 | `Robot.setBattery` (con *clamp*) | **No** (`UPDATE robot SET battery=250` aceptado) |
+| 9 | Solo se despacha con batería ≥ 20 % | `MIN_BATTERY` en el servicio | **No** (regla de negocio dependiente del momento; no es una restricción estática) |
+| 10 | El destino es una celda transitable | `RoutePlanner.isWalkable` al crear | **No** (la grilla es código, no datos) |
+| 11 | El robot de un pedido pertenece a su mismo almacén | Servicio (solo hay un almacén) | **No** |
+| 12 | Sin actualizaciones perdidas en pedido/robot | `@Version` (columna `version bigint not null`) | **Parcial**: la comprobación la hace Hibernate en el `WHERE`, la BD solo guarda el contador |
+| 13 | Un pedido `DELIVERED` deja al AMR `IDLE`; un AMR `BUSY` implica pedido activo | Servicio | **No** (`UPDATE robot SET status='BUSY', battery=250` sin pedido activo, aceptado) |
+
+Demostración en Postgres dentro de `BEGIN ... ROLLBACK` (para no ensuciar los datos): la BD aceptó los casos 4, 6, 8 y 13 y solo rechazó el 1. **Conclusión:** las invariantes 4–13 dependen exclusivamente del código. Se pueden endurecer con Flyway (como propone el proyecto de cierre): `CHECK (battery BETWEEN 0 AND 100)`, `CHECK` de coherencia estado/robot y el índice único parcial del punto 6.

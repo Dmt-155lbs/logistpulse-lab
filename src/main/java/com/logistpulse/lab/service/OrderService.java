@@ -138,7 +138,10 @@ public class OrderService {
         return OrderDto.from(order);
     }
 
-    /** Transiciones restantes: IN_TRANSIT, DELIVERED, CANCELLED. Valida contra la máquina de estados. */
+    /**
+     * Transiciones restantes: IN_TRANSIT, DELIVERED, CANCELLED, RETURNED. RETURNED (devolución del cliente) no toca
+     * al robot: al entregar ya quedó IDLE y el pedido conserva la referencia solo como histórico; liberar o reasignar
+     * ese robot aquí podría pisar una misión posterior. Valida contra la máquina de estados. */
     @Transactional
     public OrderDto transition(Long id, OrderStatus to) {
         if (to == OrderStatus.DISPATCHED) {

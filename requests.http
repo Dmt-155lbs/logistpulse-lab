@@ -109,3 +109,19 @@ GET {{host}}/api/orders?sort=id,up
 
 ### [Parte 3] size se limita a 100 en el servicio
 GET {{host}}/api/orders?size=100000
+
+### [Parte 4] Devolver un pedido ya entregado (DELIVERED -> RETURNED)
+POST {{host}}/api/orders/1/transitions
+Content-Type: application/json
+
+{ "to": "RETURNED" }
+
+### [Parte 4] RETURNED es terminal -> 409 ante cualquier otra transición
+POST {{host}}/api/orders/1/transitions
+Content-Type: application/json
+
+{ "to": "CANCELLED" }
+
+### [Parte 4] Despacho (para la prueba de concurrencia lanza dos a la vez desde la terminal:
+###   curl -s -X POST localhost:8080/api/orders/2/dispatch & curl -s -X POST localhost:8080/api/orders/2/dispatch & wait )
+POST {{host}}/api/orders/2/dispatch
