@@ -24,7 +24,6 @@ import java.util.UUID;
 import org.springframework.data.domain.Page;
 import org.springframework.data.domain.PageRequest;
 import org.springframework.data.domain.Pageable;
-import org.springframework.data.domain.Sort;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
@@ -33,6 +32,9 @@ public class OrderService {
 
     /** Un AMR con menos batería que esto no recibe pedidos. */
     static final int MIN_BATTERY = 20;
+
+    /** Tamaño máximo de página permitido. */
+    static final int MAX_PAGE_SIZE = 100;
 
     private final OrderRepository orders;
     private final RobotRepository robots;
@@ -78,11 +80,21 @@ public class OrderService {
     }
 
     @Transactional(readOnly = true)
-    public PageDto<OrderDto> list(OrderStatus status, int page, int size) {
-        int safeSize = Math.min(Math.max(size, 1), 100);
+    public PageDto<OrderDto> list(OrderStatus status, String customer, String sort, int page, int size) {
+        // el límite vive aquí (no solo en el recurso) para que cualquier llamador del servicio lo respete
+        int safeSize = Math.min(Math.max(size, 1), MAX_PAGE_SIZE);
         int safePage = Math.max(page, 0);
-        Pageable pageable = PageRequest.of(safePage, safeSize, Sort.by("id").descending());
-        Page<Order> result = status == null ? orders.findAll(pageable) : orders.findByStatus(status, pageable);
+        Pageable pageable = PageRequest.of(safePage, safeSize, OrderSorting.parse(sort));
+        boolean byCustomer = customer != null && !customer.isBlank();
+        String term = byCustomer ? customer.trim() : null;
+        Page<Order> result;
+        if (byCustomer) {
+            result = status == null
+                    ? orders.findByCustomerNameContainingIgnoreCase(term, pageable)
+                    : orders.findByStatusAndCustomerNameContainingIgnoreCase(status, term, pageable);
+        } else {
+            result = status == null ? orders.findAll(pageable) : orders.findByStatus(status, pageable);
+        }
         List<OrderDto> content = result.getContent().stream().map(OrderDto::from).toList();
         return new PageDto<>(content, safePage, safeSize, result.getTotalElements(), result.getTotalPages(), java.util.Map.of());
     }

@@ -88,3 +88,24 @@ POST {{host}}/api/orders
 Content-Type: application/json
 
 { "code": "mal", "customer": "", "destX": -1, "destY": 0 }
+
+### [Parte 3] Filtro por cliente (contiene, sin distinguir mayúsculas)
+GET {{host}}/api/orders?customer=farmacia
+
+### [Parte 3] Cliente + estado combinados
+GET {{host}}/api/orders?customer=farmacia&status=CREATED
+
+### [Parte 3] Orden por fecha descendente (los enlaces de paginación conservan customer y sort)
+GET {{host}}/api/orders?sort=createdAt,desc&size=2&page=1
+
+### [Parte 3] Orden por cliente ascendente con filtro
+GET {{host}}/api/orders?customer=a&sort=customer,asc&size=3
+
+### [Parte 3] Campo de orden fuera de la lista blanca -> 400
+GET {{host}}/api/orders?sort=version,asc
+
+### [Parte 3] Dirección inválida -> 400
+GET {{host}}/api/orders?sort=id,up
+
+### [Parte 3] size se limita a 100 en el servicio
+GET {{host}}/api/orders?size=100000

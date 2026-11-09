@@ -108,3 +108,55 @@ Sin `@EntityGraph` aparecen 7: la consulta principal (1) y el `count` de la pagi
 ### Índice sobre `status`
 Se verificó con `logging.level.org.hibernate.SQL=debug` que Hibernate emite `create index idx_orders_status on orders (status)`.
 Justificación: `status` es el criterio de filtrado de `GET /api/orders?status=` (`findByStatus`) y de las operaciones sobre pedidos activos (p. ej. métricas por estado); sin índice cada filtro recorre toda la tabla `orders`, que es la que más crece (los `DELIVERED`/`CANCELLED` se acumulan). Salvedades: la cardinalidad es baja (5 valores), por lo que el índice solo es realmente útil cuando se filtra por estados poco frecuentes (`CREATED`, `DISPATCHED`, `IN_TRANSIT`), que son los operativos; además cada escritura (cambio de estado) también actualiza el índice. Con más tráfico sería preferible un índice compuesto `(status, id)` o `(status, created_at)` para cubrir también el orden de la paginación.
+
+## Parte 3 · Spring Data, paginación y HATEOAS
+
+### Qué se implementó
+- `repo/OrderRepository.java`: `findByCustomerNameContainingIgnoreCase` y `findByStatusAndCustomerNameContainingIgnoreCase` (métodos derivados, ambos con `@EntityGraph`). `Containing` escapa `%` y `_` del término.
+- `service/OrderSorting.java`: convierte `?sort=campo,dir` en `Sort` con **lista blanca** (`id`, `code`, `customer`→`customerName`, `status`, `createdAt`, `etaMinutes`); campo o dirección inválidos, o formato raro, lanzan `ApiException(400)`. Añade desempate por `id` para que la paginación sea estable. Sin parámetro: `id desc` (comportamiento anterior).
+- `OrderService.list(status, customer, sort, page, size)`: cliente en blanco = sin filtro; cliente + estado se combinan; constante `MAX_PAGE_SIZE = 100` aplicada en el servicio.
+- `OrderResource.list`: nuevos `@QueryParam("customer")` y `@QueryParam("sort")`; `pageUrl` los incluye en `self/first/prev/next/last`.
+- Tests unitarios sin contexto Spring: `OrderSortingTest` (5 casos) y `OrderServiceListTest` (4 casos, repositorios con Mockito: límite de tamaño, página/size mínimos, cliente en blanco, cliente+estado).
+- Ejemplos en `requests.http`.
+
+### Cómo se probó
+`./mvnw -q test`: 20 tests, 0 fallos. Con la app en Modo A y 4 pedidos extra creados (`Farmacia Sana`, `FARMACIA Fybeca`, `Bodega Norte`, `Super 100%`):
+| Petición | Resultado observado |
+|---|---|
+| `?customer=farmacia` | 3 pedidos: `FARMACIA Fybeca`, `Farmacia Sana`, `Farmacia Cruz Azul` (sin distinguir mayúsculas) |
+| `?customer=farmacia&status=CREATED` | los mismos 3 (todos `CREATED`) |
+| `?sort=customer,asc&size=3` | `Bodega Norte`, `FARMACIA Fybeca`, `Farmacia Cruz Azul` |
+| `?customer=a&sort=createdAt,desc&size=2&page=1` | enlaces `self/first/prev/next/last` = `.../api/orders?page=N&size=2&customer=a&sort=createdAt%2Cdesc` (conservan filtro y orden) |
+| `?sort=version,asc` | 400 `{"error":"Campo de orden no permitido: 'version'. Permitidos: [code, createdAt, customer, etaMinutes, id, status]","status":400}` |
+| `?sort=id,up` | 400 `Dirección de orden inválida: 'up' (asc o desc)` |
+| `?customer=%25` (literal `%`) | 1 resultado (`Super 100%`): el comodín queda escapado |
+| `?customer=zzz` | 200 con `content: []`, `totalPages: 0` |
+| `?size=100000` | respuesta con `"size":100` |
+
+### ★ Grafo de estados y enlaces HATEOAS
+Los enlaces salen de `OrderResource.linked()` y de `OrderStatus.next()`; `self` y `collection` están siempre presentes.
+
+```mermaid
+stateDiagram-v2
+    [*] --> CREATED
+    CREATED --> DISPATCHED : dispatch
+    CREATED --> CANCELLED : to-cancelled
+    DISPATCHED --> IN_TRANSIT : to-in_transit
+    DISPATCHED --> CANCELLED : to-cancelled
+    IN_TRANSIT --> DELIVERED : to-delivered
+    DELIVERED --> [*]
+    CANCELLED --> [*]
+```
+
+| Estado | Enlaces además de `self` y `collection` | Destino |
+|---|---|---|
+| `CREATED` | `dispatch` (`POST /{id}/dispatch`), `to-cancelled` (`POST /{id}/transitions`) | `DISPATCHED`, `CANCELLED` |
+| `DISPATCHED` | `to-in_transit`, `to-cancelled` (ambos `POST /{id}/transitions`) | `IN_TRANSIT`, `CANCELLED` |
+| `IN_TRANSIT` | `to-delivered` | `DELIVERED` (no se puede cancelar) |
+| `DELIVERED` | ninguno | terminal |
+| `CANCELLED` | ninguno | terminal |
+
+Detalle: la transición a `DISPATCHED` no aparece como `to-dispatched` porque se hace por `/dispatch` (asigna AMR y ETA); el servicio rechaza con 400 ese destino en `/transitions`. Así el cliente descubre las acciones válidas sin duplicar la máquina de estados (HATEOAS). Observación en las pruebas: `DELETE` (Parte 1) solo es válido en `CREATED`, pero no se ofrece como enlace.
+
+### Reto: ¿por qué limitar `size` a 100 en el servicio y no solo en el recurso?
+El recurso es solo una de las puertas de entrada: el servicio puede ser invocado desde otros llamadores (otro recurso, un listener de mensajes, un job programado, tests). La regla "nunca se carga más de 100 filas por consulta" es una protección de recursos del sistema (memoria, tiempo de consulta, tamaño de la respuesta, y en el caso de N+1 el número de consultas), no un detalle del protocolo HTTP; por eso debe vivir donde se aplica la lógica de negocio y no depender de que cada capa de entrada se acuerde de validarla. Un `size=100000` sin límite cargaría todas las filas en memoria en una sola petición (DoS accidental o malicioso). Además un recurso podría cambiar o duplicarse y perder el límite. Lo comprueba `OrderServiceListTest.limitaElTamanoDePaginaA100`, que invoca al servicio directamente sin pasar por HTTP, y la prueba real con `?size=100000` devolvió `size: 100`.
