@@ -5,10 +5,17 @@ import java.util.List;
 /**
  * Plano del almacén. Leyenda:
  *   '.' pasillo libre (costo 1)
- *   ',' zona congestionada (costo 5)
+ *   ',' zona congestionada (costo 2)
  *   '#' estantería / obstáculo (bloqueado)
  */
 public final class WarehouseGrid {
+
+    /** Costo de entrar a una celda de pasillo libre. */
+    public static final int FREE_COST = 1;
+    /** Costo de entrar a una celda congestionada. */
+    public static final int CONGESTED_COST = 2;
+    /** Costo mínimo por celda: la heurística A* se escala con él para seguir siendo admisible. */
+    public static final int MIN_COST = Math.min(FREE_COST, CONGESTED_COST);
 
     private final List<String> rows;
     private final int width;
@@ -50,6 +57,6 @@ public final class WarehouseGrid {
 
     /** Costo de entrar a la celda. Solo válido si walkable(x, y). */
     public int cost(int x, int y) {
-        return rows.get(y).charAt(x) == ',' ? 5 : 1;
+        return rows.get(y).charAt(x) == ',' ? CONGESTED_COST : FREE_COST;
     }
 }

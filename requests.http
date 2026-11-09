@@ -125,3 +125,18 @@ Content-Type: application/json
 ### [Parte 4] Despacho (para la prueba de concurrencia lanza dos a la vez desde la terminal:
 ###   curl -s -X POST localhost:8080/api/orders/2/dispatch & curl -s -X POST localhost:8080/api/orders/2/dispatch & wait )
 POST {{host}}/api/orders/2/dispatch
+
+### [Parte 5] Ruta que rodea la zona congestionada vs. ruta que la atraviesa
+GET {{host}}/api/routes?fromX=5&fromY=2&toX=5&toY=5
+
+###
+GET {{host}}/api/routes?fromX=5&fromY=2&toX=5&toY=4
+
+### [Parte 5] Pedir dos veces la misma ruta y comparar logistpulse_route_plan_seconds_count (Modo B)
+GET {{host}}/api/routes?fromX=1&fromY=0&toX=10&toY=7
+
+###
+GET {{host}}/actuator/prometheus
+
+### [Parte 5] Diagonales: arranca con --lab.route.diagonal=true; la respuesta incluye exactCost (real) y cost (techo)
+GET {{host}}/api/routes?fromX=0&fromY=0&toX=11&toY=7
