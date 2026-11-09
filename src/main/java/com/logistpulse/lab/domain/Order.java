@@ -8,6 +8,7 @@ import jakarta.persistence.FetchType;
 import jakarta.persistence.GeneratedValue;
 import jakarta.persistence.GenerationType;
 import jakarta.persistence.Id;
+import jakarta.persistence.Index;
 import jakarta.persistence.ManyToOne;
 import jakarta.persistence.Table;
 import jakarta.persistence.Version;
@@ -15,7 +16,7 @@ import java.time.Instant;
 
 /** "order" es palabra reservada en SQL, por eso la tabla se llama orders. */
 @Entity
-@Table(name = "orders")
+@Table(name = "orders", indexes = @Index(name = "idx_orders_status", columnList = "status"))
 public class Order {
 
     @Id
