@@ -73,3 +73,18 @@ POST {{host}}/api/robots/5/charge
 
 ### Métricas Prometheus
 GET {{host}}/actuator/prometheus
+
+### [Parte 1] Un robot por id (404 si no existe)
+GET {{host}}/api/robots/2
+
+###
+GET {{host}}/api/robots/99
+
+### [Parte 1] Borrar un pedido CREATED -> 204 (otro estado -> 409, inexistente -> 404)
+DELETE {{host}}/api/orders/3
+
+### [Parte 1] Validación -> 400 con la lista de campos inválidos
+POST {{host}}/api/orders
+Content-Type: application/json
+
+{ "code": "mal", "customer": "", "destX": -1, "destY": 0 }

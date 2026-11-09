@@ -27,6 +27,12 @@ public class RobotResource {
         return service.list();
     }
 
+    @GET
+    @Path("/{id}")
+    public RobotDto get(@PathParam("id") Long id) {
+        return service.get(id);
+    }
+
     @POST
     @Path("/{id}/charge")
     public RobotDto charge(@PathParam("id") Long id) {

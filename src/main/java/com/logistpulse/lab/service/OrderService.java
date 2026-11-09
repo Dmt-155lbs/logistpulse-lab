@@ -87,6 +87,16 @@ public class OrderService {
         return new PageDto<>(content, safePage, safeSize, result.getTotalElements(), result.getTotalPages(), java.util.Map.of());
     }
 
+    /** Solo se pueden borrar pedidos CREATED (aún sin AMR asignado). */
+    @Transactional
+    public void delete(Long id) {
+        Order order = find(id);
+        if (order.getStatus() != OrderStatus.CREATED) {
+            throw new ApiException(409, "Solo se pueden borrar pedidos CREATED; el pedido " + id + " está " + order.getStatus());
+        }
+        orders.delete(order);
+    }
+
     /**
      * CREATED → DISPATCHED: asigna el AMR libre con batería suficiente, calcula ruta y ETA y publica el evento.
      * Ojo (ejercicio): hay una llamada HTTP al transportista dentro de la transacción.

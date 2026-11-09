@@ -23,6 +23,11 @@ public class RobotService {
         return robots.findAll().stream().map(RobotDto::from).toList();
     }
 
+    @Transactional(readOnly = true)
+    public RobotDto get(Long id) {
+        return RobotDto.from(robots.findById(id).orElseThrow(() -> new ApiException(404, "Robot " + id + " no existe")));
+    }
+
     @Transactional
     public RobotDto charge(Long id) {
         Robot robot = robots.findById(id).orElseThrow(() -> new ApiException(404, "Robot " + id + " no existe"));

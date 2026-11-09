@@ -13,5 +13,6 @@ public class JerseyConfig extends ResourceConfig {
         register(UiResource.class);
         register(ApiExceptionMapper.class);
         register(OptimisticLockMapper.class);
+        register(ConstraintViolationMapper.class);
     }
 }
