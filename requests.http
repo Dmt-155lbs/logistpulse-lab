@@ -140,3 +140,33 @@ GET {{host}}/actuator/prometheus
 
 ### [Parte 5] Diagonales: arranca con --lab.route.diagonal=true; la respuesta incluye exactCost (real) y cost (techo)
 GET {{host}}/api/routes?fromX=0&fromY=0&toX=11&toY=7
+
+### [Parte 6] Transportista lento: el cliente corta a los 2 s (SIN reintento: es un timeout) y usa el ETA local
+POST {{host}}/api/orders
+Content-Type: application/json
+
+{ "code": "LP-SLOW2", "customer": "Prueba timeout", "destX": 5, "destY": 3 }
+
+### [Parte 6.4] Transportista que responde 503 siempre -> 3 intentos (1 + 2 reintentos) y ETA local
+POST {{host}}/api/orders
+Content-Type: application/json
+
+{ "code": "LP-FAIL5", "customer": "Prueba 5xx", "destX": 5, "destY": 3 }
+
+### [Parte 6.4] Falla 2 veces con 503 y luego responde ETA 42 (antes de repetir: POST localhost:9091/__admin/scenarios/reset)
+POST {{host}}/api/orders
+Content-Type: application/json
+
+{ "code": "LP-FLAKY1", "customer": "Prueba intermitente", "destX": 5, "destY": 3 }
+
+### [Parte 6.4] Transportista que responde 400 -> 1 solo intento (los 4xx no se reintentan)
+POST {{host}}/api/orders
+Content-Type: application/json
+
+{ "code": "LP-BAD4", "customer": "Prueba 4xx", "destX": 5, "destY": 3 }
+
+### [Parte 6] Contador de degradaciones
+GET {{host}}/actuator/metrics/logistpulse.carrier.fallback
+
+### [Parte 6.4] Reiniciar los escenarios de WireMock (para repetir LP-FLAKY1)
+POST http://localhost:9091/__admin/scenarios/reset

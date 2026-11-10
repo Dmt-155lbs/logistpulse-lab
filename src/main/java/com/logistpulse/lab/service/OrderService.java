@@ -24,11 +24,17 @@ import java.util.UUID;
 import org.springframework.data.domain.Page;
 import org.springframework.data.domain.PageRequest;
 import org.springframework.data.domain.Pageable;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.PlatformTransactionManager;
 import org.springframework.transaction.annotation.Transactional;
+import org.springframework.transaction.support.TransactionTemplate;
 
 @Service
 public class OrderService {
+
+    private static final Logger log = LoggerFactory.getLogger(OrderService.class);
 
     /** Un AMR con menos batería que esto no recibe pedidos. */
     static final int MIN_BATTERY = 20;
@@ -42,18 +48,23 @@ public class OrderService {
     private final RoutePlanner planner;
     private final CarrierClient carrier;
     private final DispatchEventPublisher events;
+    private final TransactionTemplate readTx;
+    private final TransactionTemplate writeTx;
     private final Counter created;
     private final Counter dispatched;
 
     public OrderService(OrderRepository orders, RobotRepository robots, WarehouseRepository warehouses,
                         RoutePlanner planner, CarrierClient carrier, DispatchEventPublisher events,
-                        MeterRegistry registry) {
+                        PlatformTransactionManager tm, MeterRegistry registry) {
         this.orders = orders;
         this.robots = robots;
         this.warehouses = warehouses;
         this.planner = planner;
         this.carrier = carrier;
         this.events = events;
+        this.readTx = new TransactionTemplate(tm);
+        this.readTx.setReadOnly(true);
+        this.writeTx = new TransactionTemplate(tm);
         this.created = Counter.builder("logistpulse.orders.created").description("Pedidos creados").register(registry);
         this.dispatched = Counter.builder("logistpulse.orders.dispatched").description("Pedidos despachados").register(registry);
     }
@@ -109,33 +120,68 @@ public class OrderService {
         orders.delete(order);
     }
 
+    /** Datos mínimos que necesita la consulta al transportista; se leen en una transacción corta y de solo lectura. */
+    private record DispatchPlan(String code, RouteDto route) {
+    }
+
     /**
      * CREATED → DISPATCHED: asigna el AMR libre con batería suficiente, calcula ruta y ETA y publica el evento.
-     * Ojo (ejercicio): hay una llamada HTTP al transportista dentro de la transacción.
+     *
+     * Este método NO es @Transactional a propósito (Parte 6.3). Antes la llamada HTTP al transportista (hasta 2 s de
+     * timeout, más con reintentos) ocurría dentro de la transacción: durante ese tiempo se retenía una conexión de la
+     * pool de Hikari (10 por defecto; 10 despachos lentos simultáneos agotan la pool y TODAS las demás peticiones
+     * esperan hasta 30 s por una conexión), la transacción vivía más de lo necesario y, con bloqueo optimista, cuanto
+     * más larga la ventana mayor la probabilidad de conflicto @Version. Ahora hay tres pasos:
+     *  1. transacción corta de solo lectura: valida (pedido existe y está CREATED, hay AMR libre) y calcula la ruta;
+     *  2. SIN transacción ni conexión: consulta el ETA al transportista;
+     *  3. transacción corta de escritura: RE-valida (otro hilo pudo despachar el pedido o tomar el AMR mientras tanto),
+     *     asigna y registra el envío del evento tras el commit. @Version sigue siendo la red de seguridad ante la carrera.
+     * (Se usa TransactionTemplate: un @Transactional en un método privado/interno del mismo bean no pasaría por el
+     * proxy y no abriría transacción.)
      */
-    @Transactional
     public OrderDto dispatch(Long id) {
-        Order order = find(id);
+        DispatchPlan plan = readTx.execute(status -> {
+            Order order = find(id);
+            requireDispatchable(order);
+            requireFreeRobot();
+            Warehouse w = order.getWarehouse();
+            RouteDto route = planner.plan(new Point(w.getOriginX(), w.getOriginY()),
+                    new Point(order.getDestX(), order.getDestY()));
+            return new DispatchPlan(order.getCode(), route);
+        });
+
+        // Sin transacción abierta: la conexión de la pool ya fue devuelta.
+        int eta = carrier.etaMinutes(plan.code()).orElseGet(() -> {
+            int local = plan.route().cost() * 2;
+            log.warn("Pedido {}: ETA de contingencia {} min (costo de ruta {} x 2) porque el transportista no respondió",
+                    plan.code(), local, plan.route().cost());
+            return local;
+        });
+
+        return writeTx.execute(status -> {
+            Order order = find(id);
+            requireDispatchable(order);   // re-validación: el estado pudo cambiar durante la llamada HTTP
+            Robot robot = requireFreeRobot();
+            order.setStatus(OrderStatus.DISPATCHED);
+            order.setRobot(robot);
+            order.setEtaMinutes(eta);
+            robot.setStatus(RobotStatus.BUSY);
+            dispatched.increment();
+            events.publishAfterCommit(order.getId());   // se enviará tras el commit de ESTA transacción
+            return OrderDto.from(order);
+        });
+    }
+
+    private void requireDispatchable(Order order) {
         if (!order.getStatus().canGoTo(OrderStatus.DISPATCHED)) {
             throw new ApiException(409, "Transición ilegal " + order.getStatus() + " → DISPATCHED");
         }
-        Robot robot = robots.findByStatusAndBatteryGreaterThanEqualOrderByIdAsc(RobotStatus.IDLE, MIN_BATTERY)
+    }
+
+    private Robot requireFreeRobot() {
+        return robots.findByStatusAndBatteryGreaterThanEqualOrderByIdAsc(RobotStatus.IDLE, MIN_BATTERY)
                 .stream().findFirst()
                 .orElseThrow(() -> new ApiException(409, "No hay AMR disponible (libre y con batería ≥ " + MIN_BATTERY + "%)"));
-
-        Warehouse w = order.getWarehouse();
-        RouteDto route = planner.plan(new Point(w.getOriginX(), w.getOriginY()),
-                new Point(order.getDestX(), order.getDestY()));
-        int eta = carrier.etaMinutes(order.getCode()).orElse(route.cost() * 2);
-
-        order.setStatus(OrderStatus.DISPATCHED);
-        order.setRobot(robot);
-        order.setEtaMinutes(eta);
-        robot.setStatus(RobotStatus.BUSY);
-
-        dispatched.increment();
-        events.publishAfterCommit(order.getId());
-        return OrderDto.from(order);
     }
 
     /**

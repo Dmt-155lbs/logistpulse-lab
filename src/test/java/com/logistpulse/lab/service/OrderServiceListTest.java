@@ -20,6 +20,7 @@ import org.mockito.ArgumentCaptor;
 import org.springframework.data.domain.Page;
 import org.springframework.data.domain.PageImpl;
 import org.springframework.data.domain.Pageable;
+import org.springframework.transaction.PlatformTransactionManager;
 
 /** Prueba de la lógica de listado del servicio con repositorios simulados (sin contexto Spring). */
 class OrderServiceListTest {
@@ -31,7 +32,7 @@ class OrderServiceListTest {
     void setUp() {
         orders = mock(OrderRepository.class);
         service = new OrderService(orders, mock(RobotRepository.class), mock(WarehouseRepository.class),
-                null, null, null, new SimpleMeterRegistry());
+                null, null, null, mock(PlatformTransactionManager.class), new SimpleMeterRegistry());
         Page<Order> empty = new PageImpl<>(List.of());
         when(orders.findAll(any(Pageable.class))).thenReturn(empty);
         when(orders.findByStatus(any(), any(Pageable.class))).thenReturn(empty);

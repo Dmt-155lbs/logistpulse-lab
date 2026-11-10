@@ -1,19 +1,152 @@
 {
   "mappings": [
     {
+      "name": "ETA siempre 503 (Parte 6.4): códigos LP-FAIL5*",
+      "priority": 1,
+      "request": {
+        "method": "GET",
+        "urlPath": "/carrier/eta",
+        "queryParameters": {
+          "code": {
+            "matches": "LP-FAIL5.*"
+          }
+        }
+      },
+      "response": {
+        "status": 503,
+        "headers": {
+          "Content-Type": "application/json"
+        },
+        "jsonBody": {
+          "error": "carrier unavailable"
+        }
+      }
+    },
+    {
+      "name": "ETA 4xx (Parte 6.4, nunca se reintenta): códigos LP-BAD4*",
+      "priority": 1,
+      "request": {
+        "method": "GET",
+        "urlPath": "/carrier/eta",
+        "queryParameters": {
+          "code": {
+            "matches": "LP-BAD4.*"
+          }
+        }
+      },
+      "response": {
+        "status": 400,
+        "headers": {
+          "Content-Type": "application/json"
+        },
+        "jsonBody": {
+          "error": "bad request"
+        }
+      }
+    },
+    {
+      "name": "ETA inestable (Parte 6.4): LP-FLAKY* falla 2 veces con 503 y luego responde",
+      "priority": 1,
+      "request": {
+        "method": "GET",
+        "urlPath": "/carrier/eta",
+        "queryParameters": {
+          "code": {
+            "matches": "LP-FLAKY.*"
+          }
+        }
+      },
+      "response": {
+        "status": 503,
+        "headers": {
+          "Content-Type": "application/json"
+        },
+        "jsonBody": {
+          "error": "warming up"
+        }
+      },
+      "scenarioName": "flaky",
+      "requiredScenarioState": "Started",
+      "newScenarioState": "Second"
+    },
+    {
+      "name": "ETA inestable: 2.º intento sigue fallando",
+      "priority": 1,
+      "request": {
+        "method": "GET",
+        "urlPath": "/carrier/eta",
+        "queryParameters": {
+          "code": {
+            "matches": "LP-FLAKY.*"
+          }
+        }
+      },
+      "response": {
+        "status": 503,
+        "headers": {
+          "Content-Type": "application/json"
+        },
+        "jsonBody": {
+          "error": "warming up"
+        }
+      },
+      "scenarioName": "flaky",
+      "requiredScenarioState": "Second",
+      "newScenarioState": "Recovered"
+    },
+    {
+      "name": "ETA inestable: recuperado",
+      "priority": 1,
+      "request": {
+        "method": "GET",
+        "urlPath": "/carrier/eta",
+        "queryParameters": {
+          "code": {
+            "matches": "LP-FLAKY.*"
+          }
+        }
+      },
+      "response": {
+        "status": 200,
+        "headers": {
+          "Content-Type": "application/json"
+        },
+        "jsonBody": {
+          "code": "{{request.query.code}}",
+          "etaMinutes": 42
+        },
+        "transformers": [
+          "response-template"
+        ]
+      },
+      "scenarioName": "flaky",
+      "requiredScenarioState": "Recovered"
+    },
+    {
       "name": "ETA lento (para probar timeouts): códigos LP-SLOW*",
       "priority": 1,
       "request": {
         "method": "GET",
         "urlPath": "/carrier/eta",
-        "queryParameters": { "code": { "matches": "LP-SLOW.*" } }
+        "queryParameters": {
+          "code": {
+            "matches": "LP-SLOW.*"
+          }
+        }
       },
       "response": {
         "status": 200,
         "fixedDelayMilliseconds": 5000,
-        "headers": { "Content-Type": "application/json" },
-        "jsonBody": { "code": "{{request.query.code}}", "etaMinutes": 99 },
-        "transformers": ["response-template"]
+        "headers": {
+          "Content-Type": "application/json"
+        },
+        "jsonBody": {
+          "code": "{{request.query.code}}",
+          "etaMinutes": 99
+        },
+        "transformers": [
+          "response-template"
+        ]
       }
     },
     {
@@ -26,9 +159,16 @@
       "response": {
         "status": 200,
         "fixedDelayMilliseconds": 120,
-        "headers": { "Content-Type": "application/json" },
-        "jsonBody": { "code": "{{request.query.code}}", "etaMinutes": 25 },
-        "transformers": ["response-template"]
+        "headers": {
+          "Content-Type": "application/json"
+        },
+        "jsonBody": {
+          "code": "{{request.query.code}}",
+          "etaMinutes": 25
+        },
+        "transformers": [
+          "response-template"
+        ]
       }
     }
   ]

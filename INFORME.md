@@ -290,3 +290,69 @@ Cambio en `WarehouseGrid.CONGESTED_COST`; tests actualizados (`AStarPathfinderTe
 3. **TTL** (ya presente, `spring.cache.redis.time-to-live=10m`): red de seguridad para lo que no controlamos (entradas huérfanas de despliegues anteriores, cambios de plano hechos por otro medio): acota la obsolescencia y el crecimiento. En el perfil local `simple` no hay TTL; allí la versión en la clave y el `@CacheEvict` son la defensa.
 
 Descartado: invalidar solo con TTL (ventana de datos erróneos de hasta 10 min tras cada cambio), y vaciar Redis manualmente (`FLUSHALL`; no escala y es frágil). Pendiente si el plano viniera de base de datos: calcular `version` desde un número de revisión del plano en lugar del hash en memoria.
+
+## Parte 6 · RestClient y resiliencia
+
+Pruebas en **Modo B** (`docker compose up -d --build`). Antes de empezar hice `docker compose down -v` para partir de una BD limpia (el volumen tenía restos de pruebas de la Parte 4 con AMR en `BUSY`); no apareció ningún error del `CHECK` de `status` con `RETURNED`.
+
+### Qué se implementó
+- `integration/CarrierClient.java`: el WARN de degradación ahora dice el **motivo** (`io_error`, `server_error`, `client_error`, `empty_body`), los **intentos**, los **ms** gastados y que se usará el ETA local; contador Micrometer `logistpulse.carrier.fallback{reason=...}`; **reintento con backoff** (reto 6.4) implementado con un bucle propio (200 ms, 400 ms; propiedades `lab.carrier.max-retries=2` y `lab.carrier.retry-backoff-ms=200`). Constructor de paquete con un `Sleeper` inyectable para probar sin dormir.
+- `service/OrderService.java`: `dispatch` deja de ser `@Transactional` y se parte en tres pasos con `TransactionTemplate` (6.3); el ETA de contingencia se registra con un WARN propio (`ETA de contingencia 18 min (costo de ruta 9 x 2)`).
+- `infra/wiremock/mappings/carrier-eta.json`: códigos `LP-FAIL5*` (siempre 503), `LP-BAD4*` (siempre 400) y `LP-FLAKY*` (escenario: 503, 503 y luego 200 con `etaMinutes: 42`).
+- Pruebas: `CarrierClientTest` (5, con `MockRestServiceServer`), `OrderServiceDispatchTest` (7, Mockito + gestor de transacciones falso `support/FakeTxManager`); `OrderServiceListTest` adaptado al nuevo constructor. `requests.http` con los casos.
+
+### 6.1 `LP-SLOW1` (WireMock tarda 5 s, el cliente corta a los 2 s)
+Código original, medido:
+```
+POST /api/orders/4/dispatch  ->  HTTP 200, tiempo 2,115 s, robot AMR-01, etaMinutes 18
+WARN CarrierClient : Transportista no disponible para LP-SLOW1: I/O error on GET request for ".../carrier/eta": Request cancelled
+```
+**★ ¿Qué ETA queda y de dónde sale?** 18 minutos. No viene del transportista (que habría dicho 99): es el *fallback* `route.cost() * 2` de `OrderService.dispatch` (`carrier.etaMinutes(code).orElse(route.cost() * 2)`); la ruta (0,0)→(5,3) cuesta 9 y 9 × 2 = 18. El tiempo de respuesta es el *timeout* de lectura (2 s) más el resto: el usuario paga siempre el peor caso.
+**¿Se avisaba de la degradación?** Solo a medias: había un WARN, pero (a) no decía qué ETA se usó finalmente, (b) el mensaje técnico («Request cancelled») no indica que fue un timeout ni cuánto se esperó, (c) no había métrica, así que Prometheus/Grafana no veían nada. Ahora el log es:
+```
+WARN CarrierClient : DEGRADACIÓN: sin ETA del transportista para LP-SLOW2 (motivo=io_error, intentos=1, 2041 ms): I/O error ... Request cancelled. El llamador usará el ETA local (costo de ruta x 2)
+WARN OrderService  : Pedido LP-SLOW2: ETA de contingencia 18 min (costo de ruta 9 x 2) porque el transportista no respondió
+```
+y `GET /actuator/prometheus` muestra `logistpulse_carrier_fallback_total{reason="io_error"} 1.0` (insumo para una alerta en la Parte 8).
+
+### 6.2 Transportista apagado
+`docker compose stop carrier-mock` y despacho de un pedido a (10,5), con el código original: **HTTP 200 en 0,989 s**, `etaMinutes 30` (= costo 15 × 2) y WARN `... HTTP connect timed out`. Falla rápido por el *connect timeout* de 1 s (antes que el timeout de lectura de 2 s) y degrada igual. Después `docker compose start carrier-mock`. (No repetí esta prueba tras el refactor; el camino `io_error` quedó cubierto con test y con `LP-SLOW2`.)
+
+### 6.3 ★ La trampa: HTTP dentro de `@Transactional`
+**Riesgo.** Con `@Transactional` en `dispatch`, la transacción (y la **conexión JDBC de la pool Hikari**) se abre antes de la primera consulta y no se libera hasta el commit, así que la llamada de red (hasta 2 s de timeout) ocurre con la conexión retenida *sin hacer nada con ella*:
+1. **Pool**: Hikari tiene 10 conexiones por defecto (`maximumPoolSize=10`; es el valor por defecto de Spring Boot, no lo cambié). Diez despachos lentos simultáneos las agotan y cualquier otra petición (un `GET`, `/actuator/health`...) espera hasta 30 s (`connectionTimeout`) y falla. Un transportista lento tumba así a toda la API: el fallo de una dependencia externa se convierte en uno propio. *(El agotamiento completo es razonado; no lo provoqué.)*
+2. **Bloqueos y conflictos**: aquí el pedido y el robot usan bloqueo optimista (`@Version`), así que no hay `SELECT ... FOR UPDATE` sostenido, pero la ventana entre la lectura y el commit crece de milisegundos a 2 s, y con ella la probabilidad de que otro hilo modifique la fila y la perdedora reciba el 409. Con bloqueos pesimistas serían filas bloqueadas durante la espera.
+3. **Duración de la transacción**: las transacciones largas retienen *snapshots* (MVCC en Postgres: *bloat*, *vacuum* bloqueado) y se acercan a los *timeouts* de transacción.
+4. **Hilos**: cada petición lenta ocupa un hilo de Tomcat además de la conexión; la pool de BD, mucho menor que la de hilos, es el cuello de botella real.
+5. **Atomicidad ilusoria**: una llamada HTTP no se deshace con un `rollback`, así que meterla en la transacción no da ninguna garantía.
+
+**Evidencia medida** (`hikaricp_connections_active` consultado cada ~0,4 s durante un despacho de `LP-SLOW*`):
+```
+antes (con @Transactional):  1.0  1.0  1.0  1.0  0.0 ...   (conexión retenida mientras dura el despacho de 2,1 s)
+después (refactor):          0.0  0.0  0.0 ... 0.0 (14 muestras)   (el despacho tardó 2,097 s igual, pero sin conexión retenida)
+```
+**Refactor.** `dispatch` ya no lleva `@Transactional`:
+1. `readTx` (solo lectura, corta): carga el pedido, valida (no existe → 404, no está `CREATED` → 409, no hay AMR libre con batería ≥ 20 % → 409; falla rápido *antes* de molestar al transportista) y calcula la ruta (leer `warehouse`, que es *lazy*, necesita sesión).
+2. **Sin transacción**: `carrier.etaMinutes(code)` con fallback `route.cost()*2`.
+3. `writeTx` (corta): **re-valida** (vuelve a cargar el pedido y a buscar AMR: durante la espera otro hilo pudo despacharlo o llevarse el último robot), asigna, cambia estados y programa el evento. Si dos hilos llegan a la vez a este paso, `@Version` lo sigue detectando (409 por `ObjectOptimisticLockingFailureException` en el commit).
+
+Se usa `TransactionTemplate` y no un método `@Transactional` del mismo bean porque la **auto-invocación** (`this.paso()`) no pasa por el proxy de Spring y la anotación se ignoraría en silencio. Alternativa válida: mover los pasos a otro bean.
+
+**Pruebas.** `OrderServiceDispatchTest` comprueba con un gestor de transacciones falso que durante `carrier.etaMinutes` **no hay transacción abierta**, que se abren exactamente 2 (lectura + escritura), que sin robots o con el pedido ya despachado → 409 *sin llamar al transportista*, que con ETA caído se usa `route.cost()*2` (18) y que si «otro hilo» despacha o agota los robots durante la llamada la re-validación da 409, hace *rollback* y no programa el evento.
+**Concurrencia en vivo** (`scripts/race.py` de la Parte 4 contra el stack con el refactor): `same 15` → 15 × `(200, 409 Conflicto de concurrencia)`; `diff 15` (un único AMR libre, dos pedidos) → 15 × `(200, 409)`. Nunca dos 200 sobre el mismo pedido ni dos pedidos con el mismo robot.
+
+### 6.4 Reto: reintento con backoff solo para 5xx
+- **Qué se reintenta**: `HttpServerErrorException` (5xx). Máximo 2 reintentos (3 intentos), pausa de 200 ms y 400 ms (backoff exponencial; sin *jitter*: con un solo llamador por pedido no hace falta, con muchos clientes sincronizados convendría).
+- **Qué NO**: los 4xx (la petición es la culpable; repetirla da lo mismo) y los errores de E/S (`ResourceAccessException`: *read timeout*, *connect timeout*, conexión rechazada). **Decisión sobre timeouts**: con 2 s de timeout, 2 reintentos subirían el peor caso de ~2 s a ~6 s para el usuario, y un transportista que no contesta a tiempo suele estar saturado, así que más peticiones agravan el problema; además la petición pudo ejecutarse en el servidor (aquí es un `GET` idempotente, pero la política debe ser segura también para operaciones que no lo son). Un 5xx es una respuesta *rápida* y a menudo transitoria (despliegue, instancia reiniciándose): reintentar es barato. Verificado en vivo: `LP-SLOW2` → `intentos=1, 2041 ms`.
+- **Implementación**: bucle propio de ~25 líneas, sin `spring-retry` ni `resilience4j`: la política es pequeña, se prueba con un `Sleeper` falso y no añade dependencias (Resilience4j valdría la pena si se necesitaran *circuit breaker*, *bulkhead* y métricas unificadas).
+- **Pruebas en vivo** (WireMock; las peticiones se contaron con `POST /__admin/requests/count`):
+
+| Código | Comportamiento | Peticiones a WireMock | Tiempo | ETA resultante |
+|---|---|---|---|---|
+| `LP-FAIL5` (503 siempre) | 503, espera 200 ms, 503, espera 400 ms, 503 → degrada (`motivo=server_error, intentos=3, 644 ms`) | **3** | 0,650 s | 18 (local) |
+| `LP-FLAKY1` (503, 503, 200) | reintenta dos veces y al 3.º recibe 42 (`respondió para LP-FLAKY1 tras 3 intentos`) | **3** | 0,686 s | **42** (del transportista) |
+| `LP-BAD4` (400) | un único intento, degrada (`motivo=client_error`) | **1** | 0,038 s | 18 (local) |
+| `LP-SLOW2` (5 s) | timeout a los 2 s, **sin** reintento | 1 | 2,097 s | 18 (local) |
+
+- **Pruebas unitarias** (`CarrierClientTest`): OK sin reintentos; 500,500,OK → pausas `[200, 400]` ms y ETA 25; 3 × 503 → se rinde con exactamente 3 peticiones; 400 → 1 petición, sin pausas; `IOException` (timeout) → 1 petición, sin pausas; contador `logistpulse.carrier.fallback` por motivo.
+- `./mvnw test` → 54 tests, 0 fallos.
