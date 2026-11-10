@@ -439,3 +439,76 @@ mensaje sin id              : Flota recibió ... id=63 messageId=null -> "Mensaj
 **Pendiente / razonado**: purgar `processed_message` por antigüedad (debe retener más que la ventana máxima de reentrega) y enviar los `DISCARDED` a una *dead-letter queue* en lugar de solo avisar.
 
 `./mvnw test` (sin Docker) -> 64 tests, 0 fallos.
+
+## Parte 8 · Observabilidad y guerra de resiliencia
+
+Pruebas en **Modo B** (`docker compose down -v` y `up -d --build` para partir de una BD limpia). Sin Grafana en pantalla: verifiqué el dashboard por la API de Grafana (`/api/dashboards/uid/logistpulse-ops` y consultas por `/api/datasources/proxy/uid/prometheus/...`) y todas las métricas con la API HTTP de Prometheus (`/api/v1/query`, `/api/v1/rules`, `/api/v1/alerts`).
+
+### Qué se implementó
+- **Hallazgo previo (importante):** al abrir Prometheus, `http_server_requests_seconds_count` **no existía**. Spring Boot 4 + Jersey no registra por sí solo las métricas HTTP de Jersey (en Spring MVC sí), así que el panel «HTTP: peticiones/s por estado» del dashboard estaba **vacío**. Se registró `MetricsApplicationEventListener` de Micrometer en `JerseyConfig` (nombre `http.server.requests`). Sin esto no hay SLO de disponibilidad ni de latencia posibles.
+- `application.properties`: `management.metrics.distribution.percentiles-histogram.http.server.requests=true` (8.4) y `spring.datasource.hikari.connection-timeout=2000` (8.3). `application-docker.properties`: `spring.data.redis.timeout/connect-timeout=500ms` y `spring.rabbitmq.connection-timeout=2s` (8.3).
+- `config/CacheResilienceConfig` (`LoggingCacheErrorHandler`) y `api/ServiceUnavailableMapper` (503 JSON + `Retry-After` ante BD o Redis caídos) como correcciones del caos (8.3).
+- `config/OrderMetrics` (8.5 y 8.6): gauges `logistpulse_orders_by_status{status}` y `logistpulse_orders_dispatched_oldest_age_seconds`. Nuevo campo `Order.dispatchedAt` (se fija al despachar; `ddl-auto=update` añade la columna nullable). `config/TtlCache`: memoriza la lectura (y también el fallo) 3 s; `FleetMetrics` la usa también.
+- `infra/prometheus/rules.yml` (montado en el compose y referenciado por `rule_files`), `evaluation_interval: 5s`; 3 paneles nuevos en el dashboard (p95 por endpoint, pedidos por estado, antigüedad del DISPATCHED más viejo).
+- Pruebas nuevas: `TtlCacheTest` (3) y `ServiceUnavailableMapperTest` (3).
+
+### 8.1–8.2 Carga y flota agotada
+40 `POST /api/orders` con `destX=10,destY=5` y luego despachos consecutivos:
+```
+dispatch 1..4 -> HTTP 200 (0,16-0,52 s)   AMR-01..04 BUSY
+dispatch 5..8 -> HTTP 409 (0,013-0,026 s) {"status":409,"error":"No hay AMR disponible (libre y con batería ≥ 20%)"}
+GET /api/robots -> AMR-05 IDLE con batería 15 %, el resto BUSY
+POST /api/robots/5/charge -> 200, battery 100
+```
+**★ Estado HTTP y panel:** **409 Conflict** (error de negocio, no 5xx). Lo muestra el panel **«HTTP: peticiones/s por estado»** (`sum by (status)(rate(http_server_requests_seconds_count[1m]))`, serie `409`), que solo funciona desde que se registró la métrica de Jersey, y el stat **«AMR libres»** (`logistpulse_robots_idle`). Matiz observado: con la flota «agotada» `logistpulse_robots_idle` valía **1**, no 0, porque AMR-05 estaba libre pero con 15 % de batería (no despachable); por eso, para provocar la alerta de 8.6, primero cargué AMR-05 y luego lo despaché. Un gauge «libres **y** con batería suficiente» sería más fiel al criterio de despacho (pendiente).
+
+### 8.3 Caos
+Para cada escenario: `docker compose stop <servicio>`, sondeo (`POST dispatch`, `GET /api/routes`, `GET /api/orders`, `GET /actuator/health`), logs, Prometheus, `docker compose start <servicio>` y medida del tiempo hasta que la API vuelve a responder bien. Hice dos pasadas de RabbitMQ, Redis y BD (antes y después de las correcciones); carrier-mock ya degradaba bien desde la Parte 6.
+
+**Código original (antes de corregir):**
+
+| Escenario | API (código, tiempo) | Log | Métrica / panel | `/actuator/health` | Recuperación |
+|---|---|---|---|---|---|
+| `stop rabbitmq` | dispatch **200** 0,16 s (el evento queda PENDING en el outbox y el pedido se queda `DISPATCHED`); rutas y listados 200 | `WARN OutboxPublisher: no se pudo publicar outboxId=6 (intento 8): AmqpIOException ... UnknownHostException: rabbitmq`, cada ~1 s | `logistpulse_outbox_failures_total` sube (6 en ese momento); `published_total` no avanza; «Pedidos por estado» deja el pedido en DISPATCHED | **503** (`rabbit: DOWN`); la 1.ª llamada **no respondió en 30 s** (la corté con curl), las siguientes tardaron 1,65 s y 13 ms | pedido 6 → `IN_TRANSIT` y health UP a los **11 s** de `start` (el outbox drena solo) |
+| `stop redis` | `GET /api/routes` y `POST dispatch`: **500** (página HTML de Tomcat) tras **57,7 s**; `GET /api/orders` 200 (no usa caché) | `QueryTimeoutException: Redis command timed out`; `ConnectionWatchdog: Reconnecting...` | `http_server_requests` con `status=500` en `/api/routes` y `/dispatch`; p95 en el techo del histograma (30 s) | **503** tras 57,8 s (`redis: DOWN`) | ruta 200 y health UP a los **7 s** |
+| `stop carrier-mock` | dispatch **200** en **1,96 s** (timeout de 2 s); ETA de contingencia 30 = 15×2 | `WARN CarrierClient: DEGRADACIÓN ... motivo=io_error, intentos=1, 2008 ms` y `WARN OrderService: ETA de contingencia 30 min` | `logistpulse_carrier_fallback_total{reason="io_error"}` = 1; p95 de `/dispatch` ≈ 2 s | **200 UP** (el transportista no es componente de health) | WireMock responde a los **3 s**; el siguiente dispatch ya usa el ETA real (25 ms) |
+| `stop db` | dispatch y listado: **500 HTML tras 28,9 s**; `GET /api/routes` 200 (no usa BD) | `HikariPool-1 - Connection is not available, request timed out after 30000ms` | **`/actuator/prometheus` tardaba >10 s** (los gauges consultan la BD): Prometheus marcó `up=0` en 34 de 61 muestras (~170 s). El monitoreo quedó **ciego** justo durante el incidente | **503** tras 28,9 s (`db: DOWN`) | health UP a **1 s** de `start` |
+
+Dos conclusiones: (1) con Redis o la BD caídos la API fallaba de forma poco elegante (HTML, 30-58 s de hilos bloqueados); (2) la observabilidad dependía de la BD.
+
+**Correcciones (pequeñas y claras) y resultado después:**
+- Redis: `LoggingCacheErrorHandler` (la caché degrada a calcular con A*) más `spring.data.redis.timeout=500ms`.
+- BD: `hikari.connection-timeout=2000`, `ServiceUnavailableMapper` (503 JSON con `Retry-After: 2`) y `TtlCache` en los gauges (el fallo también se memoriza 3 s, así el scrape no se cuelga).
+- RabbitMQ: `spring.rabbitmq.connection-timeout=2s`.
+
+| Escenario | Antes | Después |
+|---|---|---|
+| `stop redis` | route/dispatch 500 HTML a los 57,7 s; health 503 a los 57,8 s | dispatch **200** en 0,94 s y route **200** en 0,50 s (calcula con A* y no cachea); listado 200 en 20 ms; health 503 en 0,58 s (`redis: DOWN`, honesto); log `WARN LoggingCacheErrorHandler: Cache 'routes' failed to get entry with key 'v619f26a0:0:0>2:2'`; cero respuestas 5xx; health UP a los 9 s de `start` |
+| `stop db` | 500 HTML a los 28,9 s; `/actuator/prometheus` >10 s, `up=0` | dispatch y listado **503 JSON** `{"error":"Servicio temporalmente no disponible; reintenta en unos segundos","status":503}` con `Retry-After: 2` en **1,9 s**; health 503 en 1,94 s; `/actuator/prometheus` **200** (3,9 s la primera vez, 22 ms después) y `up=1`; health UP a los 5 s de `start` |
+| `stop rabbitmq` | 1.ª llamada de health >30 s | 1.ª llamada de health 4,5 s, luego 11-14 ms; `GET /actuator/health/liveness` 200 en 10 ms; dispatch 200 en 0,16 s |
+
+Observación de diseño: con Rabbit o Redis caídos `/actuator/health` (agregado) devuelve 503 aunque la API siga sirviendo; por eso en la Parte 9.4 el *healthcheck* usa `/actuator/health/liveness`. No verifiqué el comportamiento del grupo `readiness` ante estas caídas (solo vi `readinessState: UP`).
+
+### 8.4 Latencia p95
+Consulta del panel «Latencia p95 por endpoint (s)» (excluye `/actuator`):
+```
+histogram_quantile(0.95, sum by (le, uri) (rate(http_server_requests_seconds_bucket{uri!~"/actuator.*"}[1m])))
+```
+Verificada en Prometheus y a través del proxy de Grafana (una serie por `uri`; en una prueba con carga: `/api/robots` 6 ms, `/api/orders` 12 ms, `/api/routes` 8 ms, `/api/orders/{id}/transitions` 27 ms y `/api/orders/{id}/dispatch` 2,0 s durante la caída del transportista). El dashboard queda con 9 paneles (confirmado por la API de Grafana).
+
+### 8.5 ★ SLOs
+| SLO | Objetivo y ventana | PromQL |
+|---|---|---|
+| **Disponibilidad del despacho** (no cuentan los 409/422: son resultados de negocio; sí los 5xx) | ≥ **99 %** de los `POST /dispatch` sin 5xx, en 30 días | `1 - sum(increase(http_server_requests_seconds_count{uri="/api/orders/{id}/dispatch",status=~"5.."}[30d])) / sum(increase(http_server_requests_seconds_count{uri="/api/orders/{id}/dispatch"}[30d]))` |
+| **Latencia p95** de la API | p95 de `/api/**` **< 1 s** en ventanas de 5 min, cumplido el 99 % del tiempo en 7 días | `histogram_quantile(0.95, sum by (le) (rate(http_server_requests_seconds_bucket{uri=~"/api/.*"}[5m]))) < 1` (cumplimiento: `avg_over_time((<expr> < bool 1)[7d:1m])`) |
+| **Tiempo máximo en `DISPATCHED`** | ningún pedido más de **120 s** en `DISPATCHED` (la flota debería pasarlo a `IN_TRANSIT` casi de inmediato), el 99 % del tiempo en 7 días | `max(logistpulse_orders_dispatched_oldest_age_seconds) < 120` (cumplimiento: `avg_over_time((max(logistpulse_orders_dispatched_oldest_age_seconds) < bool 120)[7d:1m])`) |
+
+Para el tercero hizo falta una métrica nueva (`dispatchedAt` más el gauge del pedido más viejo). Verificación: con RabbitMQ parado y un despacho, el gauge subió a **24,5 s** a los 25 s y volvió a **0** al arrancar Rabbit (el consumidor lo pasó a `IN_TRANSIT`).
+Valores reales sobre los últimos 30 min de la sesión (incluyen las caídas provocadas, por eso son malos): disponibilidad del despacho **84,5 %** (≈15 % de 5xx de las pruebas de Redis y BD con el código original), p95 de `/api/**` **0,525 s**, cumplimiento del SLO 3 **94,8 %** (el tiempo con RabbitMQ parado). Las ventanas de 7 y 30 días no se pueden verificar con tan pocos datos: las consultas con `[30d]` y `[7d]` son razonadas; las de 30 min están ejecutadas. Limitación: los pedidos que ya estaban `DISPATCHED` antes de añadir `dispatchedAt` tienen la fecha `NULL` y no cuentan.
+
+### 8.6 Reto: `logistpulse_orders_by_status` y alerta
+- Gauge `logistpulse_orders_by_status{status="CREATED|DISPATCHED|IN_TRANSIT|DELIVERED|CANCELLED|RETURNED"}`, uno por estado. **Costo:** una única consulta agregada (`select status, count(*) ... group by status`, que usa `idx_orders_status`) más `min(dispatchedAt)`, reutilizada 3 s (`lab.metrics.orders-cache-ms`) por los 7 gauges en lugar de 7 consultas por scrape cada 5 s; el costo del scrape no crece con el número de pedidos. Salida real: `CREATED 30, DELIVERED 8, DISPATCHED 0, IN_TRANSIT 5, CANCELLED 0, RETURNED 0`.
+- Regla `SinAmrLibres` (`infra/prometheus/rules.yml`): `logistpulse_robots_idle == 0` durante `for: 1m`. `GET /api/v1/rules` la muestra cargada (`state: inactive, health: ok`).
+- **Provocada:** cargué AMR-05 (100 %) y despaché hasta que `logistpulse_robots_idle` fue 0 (los siguientes dispatch daban 409). La alerta pasó a `pending` con `activeAt 00:27:44` y a **`firing` unos 66 s después** (`/api/v1/alerts`: `SinAmrLibres firing ... "No quedan AMR libres"`; también `ALERTS{alertname="SinAmrLibres",alertstate="firing"} = 1`). Al marcar un pedido `DELIVERED` (libera un AMR) volvió a `inactive` en unos 12 s. No hay Alertmanager en el stack: la alerta se ve en Prometheus pero no se notifica a nadie.
+
+`./mvnw -q test` (sin Docker) -> 70 tests, 0 fallos.

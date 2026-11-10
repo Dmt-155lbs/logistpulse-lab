@@ -47,6 +47,9 @@ public class Order {
     @Column(nullable = false)
     private Instant createdAt = Instant.now();
 
+    /** Momento en que pasó a DISPATCHED (Parte 8.5: mide cuánto lleva un pedido sin pasar a IN_TRANSIT). */
+    private Instant dispatchedAt;
+
     @Version
     private Long version;
 
@@ -74,4 +77,6 @@ public class Order {
     public Integer getEtaMinutes() { return etaMinutes; }
     public void setEtaMinutes(Integer etaMinutes) { this.etaMinutes = etaMinutes; }
     public Instant getCreatedAt() { return createdAt; }
+    public Instant getDispatchedAt() { return dispatchedAt; }
+    public void setDispatchedAt(Instant dispatchedAt) { this.dispatchedAt = dispatchedAt; }
 }

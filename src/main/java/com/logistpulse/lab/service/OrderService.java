@@ -164,6 +164,7 @@ public class OrderService {
             requireDispatchable(order);   // re-validación: el estado pudo cambiar durante la llamada HTTP
             Robot robot = requireFreeRobot();
             order.setStatus(OrderStatus.DISPATCHED);
+            order.setDispatchedAt(java.time.Instant.now());
             order.setRobot(robot);
             order.setEtaMinutes(eta);
             robot.setStatus(RobotStatus.BUSY);

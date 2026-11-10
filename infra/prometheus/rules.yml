@@ -1,0 +1,12 @@
+groups:
+  - name: logistpulse
+    rules:
+      # Reto 8.6: sin AMR libres durante 1 minuto seguido
+      - alert: SinAmrLibres
+        expr: logistpulse_robots_idle == 0
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: "No quedan AMR libres"
+          description: "logistpulse_robots_idle lleva 0 desde hace más de 1 minuto: los despachos devolverán 409."

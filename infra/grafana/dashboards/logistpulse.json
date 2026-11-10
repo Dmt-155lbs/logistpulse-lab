@@ -42,6 +42,26 @@
       "gridPos": { "x": 0, "y": 16, "w": 12, "h": 8 },
       "datasource": { "type": "prometheus", "uid": "prometheus" },
       "targets": [ { "refId": "A", "expr": "sum(jvm_memory_used_bytes{area=\"heap\"}) / 1024 / 1024", "legendFormat": "heap" } ]
+    },
+    {
+      "id": 7, "type": "timeseries", "title": "Latencia p95 por endpoint (s)",
+      "gridPos": { "x": 12, "y": 16, "w": 12, "h": 8 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "unit": "s" }, "overrides": [] },
+      "targets": [ { "refId": "A", "expr": "histogram_quantile(0.95, sum by (le, uri) (rate(http_server_requests_seconds_bucket{uri!~\"/actuator.*\"}[1m])))", "legendFormat": "{{uri}}" } ]
+    },
+    {
+      "id": 8, "type": "timeseries", "title": "Pedidos por estado",
+      "gridPos": { "x": 0, "y": 24, "w": 12, "h": 8 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [ { "refId": "A", "expr": "logistpulse_orders_by_status", "legendFormat": "{{status}}" } ]
+    },
+    {
+      "id": 9, "type": "timeseries", "title": "Antigüedad del pedido DISPATCHED más viejo (s)",
+      "gridPos": { "x": 12, "y": 24, "w": 12, "h": 8 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "unit": "s" }, "overrides": [] },
+      "targets": [ { "refId": "A", "expr": "logistpulse_orders_dispatched_oldest_age_seconds", "legendFormat": "más viejo" } ]
     }
   ]
 }
