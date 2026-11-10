@@ -356,3 +356,86 @@ Se usa `TransactionTemplate` y no un método `@Transactional` del mismo bean por
 
 - **Pruebas unitarias** (`CarrierClientTest`): OK sin reintentos; 500,500,OK → pausas `[200, 400]` ms y ETA 25; 3 × 503 → se rinde con exactamente 3 peticiones; 400 → 1 petición, sin pausas; `IOException` (timeout) → 1 petición, sin pausas; contador `logistpulse.carrier.fallback` por motivo.
 - `./mvnw test` → 54 tests, 0 fallos.
+
+## Parte 7 · Mensajería, consistencia y Outbox
+
+Pruebas en **Modo B**, salvo la comprobación final del modo lite. Las horas de los logs están en UTC.
+
+### Qué se implementó
+- `outbox/OutboxEvent` + `OutboxRepository` (tabla `outbox_event`: `id` identity, `type`, `payload`, `created_at`, `published_at`, `status` PENDING/SENT, `attempts`, `last_error`; índice `(status, id)`), `OutboxService.record(...)` (con `Propagation.MANDATORY`: falla si no hay una transacción abierta, que es justo el contrato del patrón) y `OutboxPublisher` (`@Scheduled`, cada `lab.outbox.poll-ms=1000`, lotes de `lab.outbox.batch-size=50`). El destino es una interfaz `EventSender`: `RabbitEventSender` (con `lab.messaging.enabled=true`) o `LogEventSender` (modo lite: solo escribe `[lite] evento ...` y lo marca enviado, como hacía antes). `LabApplication` con `@EnableScheduling`.
+- `OrderService.dispatch` inserta el evento en el outbox **dentro de la misma transacción de escritura** que cambia el estado; `DispatchEventPublisher` (el `afterCommit`) se elimina.
+- `messaging/DispatchedEventHandler` + `ProcessedMessage`/`ProcessedMessageRepository` (tabla `processed_message`, clave = id del mensaje): consumidor idempotente. `FleetListener` ahora delega en él y lee el `messageId`. Propiedad `lab.messaging.consumer-enabled` (7.2; en Docker `LAB_MESSAGING_CONSUMER_ENABLED`, por defecto `true`, que es como queda).
+- `application-docker.properties`: `spring.rabbitmq.publisher-confirm-type=simple` (el relé espera la confirmación del broker).
+- Pruebas: `OutboxPublisherTest` (4) y `DispatchedEventHandlerTest` (6); `OrderServiceDispatchTest` verifica que se registra el evento en el outbox solo si el despacho se completa.
+
+### 7.1 Observación del flujo (Modo B, código original)
+Despachando un pedido:
+```
+INFO DispatchEventPublisher : Evento order.dispatched publicado id=5
+INFO FleetListener          : Flota recibió order.dispatched id=5
+```
+`GET http://localhost:15672/api/queues/%2F/orders.dispatched` (guest/guest) y `docker compose exec rabbitmq rabbitmqctl list_queues name messages consumers`: `orders.dispatched  0  1` (0 mensajes, 1 consumidor); en `message_stats` `publish: 2, deliver: 2, ack: 2` tras dos despachos. Es decir, el consumidor drena al instante y la cola casi siempre se ve vacía; por eso hace falta pararlo (7.2) para verla.
+
+### 7.2 Acumulación con el consumidor parado
+`LAB_MESSAGING_CONSUMER_ENABLED=false docker compose up -d api` (la API arranca sin `@RabbitListener` activo: `consumers 0`). Se despacharon 3 pedidos (61, 62, 63):
+```
+rabbitmqctl list_queues  ->  orders.dispatched  3  0      (3 mensajes, 0 consumidores)
+GET /api/orders/{61,62,63}  ->  DISPATCHED, DISPATCHED, DISPATCHED   (nadie los pasa a IN_TRANSIT)
+```
+Nota: la API de gestión refresca las estadísticas cada ~5 s; justo después de cada despacho mostró 0, 0, 1, 1 (valores atrasados), mientras que `rabbitmqctl` ya decía 3. Al reactivar (`docker compose up -d api`) el consumidor arrancó y en los logs aparecen `Flota recibió ... id=61 / 62 / 63` en ~0,6 s (00:02:12,67 → 00:02:13,24); la cola quedó en `0 mensajes, 1 consumidor` y los 3 pedidos pasaron a `IN_TRANSIT`. (En un primer intento solo pude despachar 2 de 3, porque restos de `scripts/race.py diff` dejaban los 5 AMR `BUSY` y el tercero dio 409; liberé la flota y repetí con 3.) **Sin consumidor no se pierde nada**: los mensajes son duraderos y esperan; el estado de negocio queda «adelantado» respecto a la flota.
+
+### 7.3 ★ `afterCommit`: qué evita y qué no
+- **Qué evita**: el *mensaje fantasma* / carrera de lectura. Si se publicara *dentro* de la transacción, (a) el consumidor podría recibir el evento y consultar el pedido **antes del commit**, ver todavía `CREATED` (o nada) y fallar o actuar con datos viejos; y (b) si la transacción hiciera *rollback* (conflicto `@Version`, error posterior) el evento ya estaría publicado para un despacho que nunca ocurrió. Con `afterCommit` solo se anuncian cambios ya confirmados.
+- **Qué sigue fallando**: la **escritura dual** (*dual write*) no es atómica. Si el proceso cae (o Rabbit está caído / la red falla) **entre el commit y el envío**, el pedido queda `DISPATCHED` en la BD y el evento **no se publica nunca**: no hay reintento y la flota jamás lo sabe (queda atascado en `DISPATCHED`, el robot `BUSY`). Peor: `afterCommit` se ejecuta *después* de que el cliente ya tiene su transacción confirmada, así que una excepción al publicar ni siquiera deshace el despacho. Se evita un tipo de inconsistencia (evento sin dato) pero se acepta el contrario (dato sin evento). La solución es el Outbox (7.4).
+
+### 7.4 Patrón Outbox
+**Idea.** El estado y el evento se guardan en **una sola transacción de BD** (atómica: o ambos o ninguno); publicar en el broker pasa a ser un proceso aparte, repetible, que lee la tabla.
+
+**Diseño y decisiones**
+- *Lotes*: el relé toma hasta 50 eventos por ciclo (`LIMIT :limit`), ordenados por `id`; un evento que falla corta el lote para no adelantar a los siguientes (orden FIFO global; el orden por pedido es suficiente porque el consumidor también valida la máquina de estados).
+- *Rabbit caído*: `RabbitEventSender` lanza excepción → el evento **no** se marca enviado, se incrementan `attempts` y `last_error` (se confirma esa actualización) y se reintenta en el ciclo siguiente. Con `publisher-confirm-type=simple` + `waitForConfirmsOrDie(5 s)`, «enviado» significa que el broker **aceptó** el mensaje, no solo que se escribió en el socket.
+- *Varias instancias*: la consulta es `SELECT ... WHERE status='PENDING' ORDER BY id LIMIT n FOR UPDATE SKIP LOCKED` (nativa; funciona en PostgreSQL y en H2 2.x): cada instancia bloquea filas distintas y salta las que otra está procesando, así que no se publican dos veces en el caso normal y no hay esperas. *(Probado que la consulta funciona en Postgres y H2; no levanté dos instancias a la vez, es razonado.)* Sin `SKIP LOCKED` habría doble publicación o bloqueos entre relés; alternativas: un único relé con *leader election* o CDC (Debezium).
+- *Garantía*: **al-menos-una-vez**. Si el proceso cae tras enviar y antes del commit del `SENT`, el evento sale otra vez → el consumidor debe ser idempotente (7.5). El id del outbox viaja como `messageId` AMQP y es la clave de deduplicación.
+- *Latencia*: hasta `poll-ms` (1 s) extra. *Coste*: los bloqueos de fila se mantienen mientras dura el envío del lote (cortos con lotes de 50 y *timeout* de confirmación de 5 s). *No implementado (razonado)*: purgar las filas `SENT` antiguas (la tabla crece indefinidamente) y una cola de *dead letter* para eventos con demasiados intentos.
+
+**Prueba con Rabbit caído** (`docker compose stop rabbitmq`, 00:02:45):
+```
+dispatch 64 -> HTTP 200 en 0,272 s     dispatch 65 -> HTTP 200 en 0,150 s     (el despacho NO depende del broker)
+outbox_event:  73 | 64 | PENDING | attempts 1 | AmqpIOException: java.net.UnknownHostException: rabbitmq
+               74 | 65 | PENDING | attempts 0
+WARN OutboxPublisher : Outbox: no se pudo publicar outboxId=73 (intento 2): ... Queda PENDING y se reintenta
+```
+(el error es `UnknownHostException` porque Docker deja de resolver el nombre del contenedor parado; con el broker caído de otra forma sería `ConnectException`). `docker compose start rabbitmq` a las 00:02:57; al aceptar conexiones el relé publicó y la cola se drenó:
+```
+00:03:03,79  outbox 73: SENT, attempts 11 (10 fallos + 1 éxito)     outbox 74: SENT, attempts 1
+INFO RabbitEventSender : Evento order.dispatched publicado id=64 outboxId=73  /  id=65 outboxId=74
+INFO FleetListener     : Flota recibió order.dispatched id=64 messageId=73  /  id=65 messageId=74
+GET /api/orders/64, /65  ->  IN_TRANSIT, IN_TRANSIT
+```
+Resultado: con el código original (`afterCommit`) ese despacho habría quedado `DISPATCHED` para siempre (*razonado a partir de 7.3; no ejecuté ese escenario con el código viejo*); con el outbox se recuperó solo, ~7 s después de ordenar el arranque (lo que tarda RabbitMQ en aceptar conexiones).
+**Modo lite (sin Rabbit)**: `./mvnw spring-boot:run` + un despacho → `LogEventSender : [lite] evento order.dispatched outboxId=1 payload=4 (RabbitMQ desactivado)`, sin errores (H2 acepta el `FOR UPDATE SKIP LOCKED`).
+Métricas nuevas: `logistpulse_outbox_published_total` y `logistpulse_outbox_failures_total` (útiles para la Parte 8).
+
+### 7.5 ★ Consumidor idempotente
+**Qué pasa hoy** (código original, medido). Con el pedido 5 ya `IN_TRANSIT` publiqué un duplicado con la API de gestión (`POST /api/exchanges/%2F/amq.default/publish`, `routing_key=orders.dispatched`, `payload=5`):
+```
+INFO  FleetListener : Flota recibió order.dispatched id=5
+WARN  ConditionalRejectingErrorHandler : Execution of Rabbit message listener failed.
+Caused by: ApiException: Transición ilegal IN_TRANSIT → IN_TRANSIT
+```
+El estado de datos **no se corrompe** (la máquina de estados rechaza la transición: el pedido sigue `IN_TRANSIT`), pero Spring AMQP trata la excepción como fallo transitorio y **reencola el mensaje indefinidamente**: un *mensaje venenoso*. Conté **2165 entregas en ~3 s** (≈ 500-700/s; 6279 trazas de pila en una ventana de 20 s) saturando CPU y log, y bloqueando la cabecera de la cola (los mensajes siguientes quedan detrás). `DELETE .../contents` no lo detuvo porque el mensaje estaba en vuelo (sin confirmar): hubo que **parar la API** (`docker compose stop api`) y purgar la cola antes de reiniciar. Es el caso «bueno» (el duplicado es inofensivo para los datos); con una operación no protegida por una máquina de estados (p. ej. «sumar al inventario») el duplicado se aplicaría dos veces.
+
+**Qué se hizo** (dos defensas, en `DispatchedEventHandler`):
+1. **Tabla `processed_message`** con el id del evento del outbox (`messageId`) como clave primaria. En **una transacción**: si el id ya existe → se ignora (`DUPLICATE`); si no, se hace la transición a `IN_TRANSIT` y se inserta el id. La atomicidad es lo importante: si se registrara el id *antes* y fallara la transición se perdería el mensaje; si se registrara *después* y se cayera entre medias, se reprocesaría. Si dos entregas del mismo mensaje corren en paralelo, la segunda choca con la clave primaria, se revierte y Rabbit la reentrega (entonces ve el registro).
+2. **La máquina de estados como red de seguridad**: un mensaje sin id o un duplicado tardío (registro ya purgado) provoca un 409 de negocio; ahora se **captura y se descarta con un WARN** (`DISCARDED`) en vez de relanzarse, lo que elimina el bucle infinito. Los errores de infraestructura (BD caída) sí se propagan para que Rabbit reintente.
+
+**Prueba en vivo** (con el outbox, el pedido 63 ya `IN_TRANSIT`, mensaje original con `messageId=72`):
+```
+duplicado con message_id=72 : Flota recibió ... id=63 messageId=72 -> "Mensaje 72 ya procesado: se ignora el duplicado (pedido 63)"
+mensaje sin id              : Flota recibió ... id=63 messageId=null -> "Mensaje null descartado (pedido 63): Transición ilegal IN_TRANSIT → IN_TRANSIT"
+```
+2 entregas en 10 s (una por mensaje publicado), cola en 0, sin bucle. `select * from processed_message` muestra los ids 69, 70, 71, 72.
+**Pruebas unitarias** (`DispatchedEventHandlerTest`): el mismo mensaje dos veces transiciona una sola vez; mensajes distintos se procesan; una transición ilegal se descarta sin lanzar ni registrar; sin `messageId` solo actúa la máquina de estados; un error de infraestructura se propaga.
+**Pendiente / razonado**: purgar `processed_message` por antigüedad (debe retener más que la ventana máxima de reentrega) y enviar los `DISCARDED` a una *dead-letter queue* en lugar de solo avisar.
+
+`./mvnw test` (sin Docker) -> 64 tests, 0 fallos.

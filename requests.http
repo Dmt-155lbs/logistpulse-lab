@@ -170,3 +170,28 @@ GET {{host}}/actuator/metrics/logistpulse.carrier.fallback
 
 ### [Parte 6.4] Reiniciar los escenarios de WireMock (para repetir LP-FLAKY1)
 POST http://localhost:9091/__admin/scenarios/reset
+
+### [Parte 7.1] Estado de la cola en la API de gestión de RabbitMQ (usuario guest/guest)
+GET http://localhost:15672/api/queues/%2F/orders.dispatched
+Authorization: Basic Z3Vlc3Q6Z3Vlc3Q=
+
+### [Parte 7.2] Para ver la cola acumularse: LAB_MESSAGING_CONSUMER_ENABLED=false docker compose up -d api
+###   (despachar 3 pedidos, mirar la cola con la petición anterior y reactivar con: docker compose up -d api)
+
+### [Parte 7.5] Publicar a mano un duplicado de un mensaje ya procesado (mismo message_id que el original)
+###   Cambia payload (id del pedido) y message_id (id del evento en la tabla outbox_event / processed_message)
+POST http://localhost:15672/api/exchanges/%2F/amq.default/publish
+Authorization: Basic Z3Vlc3Q6Z3Vlc3Q=
+Content-Type: application/json
+
+{ "properties": { "message_id": "72" }, "routing_key": "orders.dispatched", "payload": "63", "payload_encoding": "string" }
+
+### [Parte 7.5] Mensaje sin id sobre un pedido que ya no admite IN_TRANSIT: se descarta con un aviso (antes: bucle infinito)
+POST http://localhost:15672/api/exchanges/%2F/amq.default/publish
+Authorization: Basic Z3Vlc3Q6Z3Vlc3Q=
+Content-Type: application/json
+
+{ "properties": {}, "routing_key": "orders.dispatched", "payload": "63", "payload_encoding": "string" }
+
+### [Parte 7.4] Métricas del outbox (publicados y fallos)
+GET {{host}}/actuator/prometheus

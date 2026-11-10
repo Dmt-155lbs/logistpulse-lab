@@ -10,7 +10,7 @@ import com.logistpulse.lab.domain.Robot;
 import com.logistpulse.lab.domain.RobotStatus;
 import com.logistpulse.lab.domain.Warehouse;
 import com.logistpulse.lab.integration.CarrierClient;
-import com.logistpulse.lab.messaging.DispatchEventPublisher;
+import com.logistpulse.lab.outbox.OutboxService;
 import com.logistpulse.lab.repo.OrderRepository;
 import com.logistpulse.lab.repo.RobotRepository;
 import com.logistpulse.lab.repo.WarehouseRepository;
@@ -47,21 +47,21 @@ public class OrderService {
     private final WarehouseRepository warehouses;
     private final RoutePlanner planner;
     private final CarrierClient carrier;
-    private final DispatchEventPublisher events;
+    private final OutboxService outbox;
     private final TransactionTemplate readTx;
     private final TransactionTemplate writeTx;
     private final Counter created;
     private final Counter dispatched;
 
     public OrderService(OrderRepository orders, RobotRepository robots, WarehouseRepository warehouses,
-                        RoutePlanner planner, CarrierClient carrier, DispatchEventPublisher events,
+                        RoutePlanner planner, CarrierClient carrier, OutboxService outbox,
                         PlatformTransactionManager tm, MeterRegistry registry) {
         this.orders = orders;
         this.robots = robots;
         this.warehouses = warehouses;
         this.planner = planner;
         this.carrier = carrier;
-        this.events = events;
+        this.outbox = outbox;
         this.readTx = new TransactionTemplate(tm);
         this.readTx.setReadOnly(true);
         this.writeTx = new TransactionTemplate(tm);
@@ -125,7 +125,8 @@ public class OrderService {
     }
 
     /**
-     * CREATED → DISPATCHED: asigna el AMR libre con batería suficiente, calcula ruta y ETA y publica el evento.
+     * CREATED → DISPATCHED: asigna el AMR libre con batería suficiente, calcula ruta y ETA y registra el evento en el
+     * outbox.
      *
      * Este método NO es @Transactional a propósito (Parte 6.3). Antes la llamada HTTP al transportista (hasta 2 s de
      * timeout, más con reintentos) ocurría dentro de la transacción: durante ese tiempo se retenía una conexión de la
@@ -135,7 +136,7 @@ public class OrderService {
      *  1. transacción corta de solo lectura: valida (pedido existe y está CREATED, hay AMR libre) y calcula la ruta;
      *  2. SIN transacción ni conexión: consulta el ETA al transportista;
      *  3. transacción corta de escritura: RE-valida (otro hilo pudo despachar el pedido o tomar el AMR mientras tanto),
-     *     asigna y registra el envío del evento tras el commit. @Version sigue siendo la red de seguridad ante la carrera.
+     *     asigna, y escribe el evento en el outbox. @Version sigue siendo la red de seguridad ante la carrera.
      * (Se usa TransactionTemplate: un @Transactional en un método privado/interno del mismo bean no pasaría por el
      * proxy y no abriría transacción.)
      */
@@ -166,8 +167,9 @@ public class OrderService {
             order.setRobot(robot);
             order.setEtaMinutes(eta);
             robot.setStatus(RobotStatus.BUSY);
+            // Outbox: el evento se guarda en la MISMA transacción que el cambio de estado; lo publica OutboxPublisher.
+            outbox.record(OutboxService.ORDER_DISPATCHED, String.valueOf(order.getId()));
             dispatched.increment();
-            events.publishAfterCommit(order.getId());   // se enviará tras el commit de ESTA transacción
             return OrderDto.from(order);
         });
     }

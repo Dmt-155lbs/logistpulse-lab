@@ -16,7 +16,7 @@ import com.logistpulse.lab.domain.Robot;
 import com.logistpulse.lab.domain.RobotStatus;
 import com.logistpulse.lab.domain.Warehouse;
 import com.logistpulse.lab.integration.CarrierClient;
-import com.logistpulse.lab.messaging.DispatchEventPublisher;
+import com.logistpulse.lab.outbox.OutboxService;
 import com.logistpulse.lab.repo.OrderRepository;
 import com.logistpulse.lab.repo.RobotRepository;
 import com.logistpulse.lab.repo.WarehouseRepository;
@@ -38,7 +38,7 @@ class OrderServiceDispatchTest {
     private RobotRepository robots;
     private RoutePlanner planner;
     private CarrierClient carrier;
-    private DispatchEventPublisher outbox;
+    private OutboxService outbox;
     private FakeTxManager tm;
     private OrderService service;
 
@@ -51,7 +51,7 @@ class OrderServiceDispatchTest {
         robots = mock(RobotRepository.class);
         planner = mock(RoutePlanner.class);
         carrier = mock(CarrierClient.class);
-        outbox = mock(DispatchEventPublisher.class);
+        outbox = mock(OutboxService.class);
         tm = new FakeTxManager();
         service = new OrderService(orders, robots, mock(WarehouseRepository.class), planner, carrier, outbox, tm,
                 new SimpleMeterRegistry());
@@ -82,7 +82,7 @@ class OrderServiceDispatchTest {
         assertThat(dto.status()).isEqualTo(OrderStatus.DISPATCHED);
         assertThat(dto.etaMinutes()).isEqualTo(25);
         assertThat(robot.getStatus()).isEqualTo(RobotStatus.BUSY);
-        verify(outbox).publishAfterCommit(7L);
+        verify(outbox).record(OutboxService.ORDER_DISPATCHED, "7");
     }
 
     @Test
@@ -102,7 +102,7 @@ class OrderServiceDispatchTest {
         assertThatThrownBy(() -> service.dispatch(7L))
                 .isInstanceOfSatisfying(ApiException.class, e -> assertThat(e.getStatus()).isEqualTo(409));
         verify(carrier, never()).etaMinutes(anyString());
-        verify(outbox, never()).publishAfterCommit(any());
+        verify(outbox, never()).record(anyString(), anyString());
     }
 
     @Test
@@ -129,7 +129,7 @@ class OrderServiceDispatchTest {
 
         assertThatThrownBy(() -> service.dispatch(7L))
                 .isInstanceOfSatisfying(ApiException.class, e -> assertThat(e.getStatus()).isEqualTo(409));
-        verify(outbox, never()).publishAfterCommit(any());
+        verify(outbox, never()).record(anyString(), anyString());
         assertThat(robot.getStatus()).isEqualTo(RobotStatus.IDLE);   // la transacción de escritura se revirtió
         assertThat(tm.rolledBack).isEqualTo(1);
     }
@@ -145,6 +145,6 @@ class OrderServiceDispatchTest {
         assertThatThrownBy(() -> service.dispatch(7L))
                 .isInstanceOfSatisfying(ApiException.class, e -> assertThat(e.getStatus()).isEqualTo(409));
         assertThat(order.getStatus()).isEqualTo(OrderStatus.CREATED);
-        verify(outbox, never()).publishAfterCommit(any());
+        verify(outbox, never()).record(anyString(), anyString());
     }
 }

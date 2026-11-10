@@ -59,6 +59,7 @@ services:
       REDIS_HOST: redis
       RABBIT_HOST: rabbitmq
       CARRIER_URL: http://carrier-mock:8080
+      LAB_MESSAGING_CONSUMER_ENABLED: ${LAB_MESSAGING_CONSUMER_ENABLED:-true}
     ports:
       - "8080:8080"
 
