@@ -11,6 +11,10 @@
     {
       "key": "orderId",
       "value": "1"
+    },
+    {
+      "key": "tmpOrderId",
+      "value": "0"
     }
   ],
   "item": [
@@ -235,7 +239,23 @@
             }
           ]
         }
-      }
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('200', () => pm.response.to.have.status(200));",
+              "pm.test('pagina con enlaces', () => {",
+              "  const b = pm.response.json();",
+              "  pm.expect(b.content).to.be.an('array').with.length.of.at.most(5);",
+              "  pm.expect(b.links).to.have.property('self');",
+              "});"
+            ]
+          }
+        }
+      ]
     },
     {
       "name": "Crear pedido",
@@ -268,9 +288,241 @@
           "script": {
             "type": "text/javascript",
             "exec": [
-              "pm.test('201', () => pm.response.to.have.status(201));",
-              "pm.test('Location', () => pm.expect(pm.response.headers.get('Location')).to.include('/api/orders/'));",
+              "const orderSchema = {",
+              "  type: 'object',",
+              "  required: ['id', 'code', 'customer', 'destX', 'destY', 'status', 'warehouse', 'createdAt', 'links'],",
+              "  properties: {",
+              "    id: { type: 'integer' },",
+              "    code: { type: 'string' },",
+              "    customer: { type: 'string' },",
+              "    destX: { type: 'integer' },",
+              "    destY: { type: 'integer' },",
+              "    status: { enum: ['CREATED', 'DISPATCHED', 'IN_TRANSIT', 'DELIVERED', 'CANCELLED', 'RETURNED'] },",
+              "    warehouse: { type: 'string' },",
+              "    robot: { type: ['string', 'null'] },",
+              "    etaMinutes: { type: ['integer', 'null'] },",
+              "    createdAt: { type: 'string' },",
+              "    links: { type: 'object' }",
+              "  }",
+              "};",
+              "// 1) código de estado",
+              "pm.test('201 Created', () => pm.response.to.have.status(201));",
+              "// 2) cabecera Location apunta al recurso creado",
+              "pm.test('Location termina en /api/orders/{id}', () => {",
+              "  const loc = pm.response.headers.get('Location');",
+              "  pm.expect(loc).to.match(/\\/api\\/orders\\/\\d+$/);",
+              "  pm.expect(loc.split('/').pop()).to.equal(String(pm.response.json().id));",
+              "});",
+              "// 3) esquema de la respuesta",
+              "pm.test('esquema del pedido', () => pm.response.to.have.jsonSchema(orderSchema));",
+              "pm.test('nace CREATED y sin robot', () => {",
+              "  pm.expect(pm.response.json().status).to.eql('CREATED');",
+              "  pm.expect(pm.response.json().robot).to.eql(null);",
+              "});",
               "pm.collectionVariables.set('orderId', pm.response.json().id);"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "Obtener pedido por id",
+      "request": {
+        "method": "GET",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "url": {
+          "raw": "{{host}}/api/orders/{{orderId}}",
+          "host": [
+            "{{host}}"
+          ],
+          "path": [
+            "api",
+            "orders",
+            "{{orderId}}"
+          ]
+        }
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "const orderSchema = {",
+              "  type: 'object',",
+              "  required: ['id', 'code', 'customer', 'destX', 'destY', 'status', 'warehouse', 'createdAt', 'links'],",
+              "  properties: {",
+              "    id: { type: 'integer' },",
+              "    code: { type: 'string' },",
+              "    customer: { type: 'string' },",
+              "    destX: { type: 'integer' },",
+              "    destY: { type: 'integer' },",
+              "    status: { enum: ['CREATED', 'DISPATCHED', 'IN_TRANSIT', 'DELIVERED', 'CANCELLED', 'RETURNED'] },",
+              "    warehouse: { type: 'string' },",
+              "    robot: { type: ['string', 'null'] },",
+              "    etaMinutes: { type: ['integer', 'null'] },",
+              "    createdAt: { type: 'string' },",
+              "    links: { type: 'object' }",
+              "  }",
+              "};",
+              "pm.test('200', () => pm.response.to.have.status(200));",
+              "pm.test('esquema del pedido', () => pm.response.to.have.jsonSchema(orderSchema));",
+              "pm.test('el id coincide con el pedido creado', () => pm.expect(pm.response.json().id).to.eql(Number(pm.collectionVariables.get('orderId'))));"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "Pedido inexistente (404)",
+      "request": {
+        "method": "GET",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "url": {
+          "raw": "{{host}}/api/orders/999999",
+          "host": [
+            "{{host}}"
+          ],
+          "path": [
+            "api",
+            "orders",
+            "999999"
+          ]
+        }
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('404', () => pm.response.to.have.status(404));"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "Obtener robot por id",
+      "request": {
+        "method": "GET",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "url": {
+          "raw": "{{host}}/api/robots/1",
+          "host": [
+            "{{host}}"
+          ],
+          "path": [
+            "api",
+            "robots",
+            "1"
+          ]
+        }
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "const robotSchema = {",
+              "  type: 'object',",
+              "  required: ['id', 'code', 'battery', 'status'],",
+              "  properties: {",
+              "    id: { type: 'integer' },",
+              "    code: { type: 'string' },",
+              "    battery: { type: 'integer', minimum: 0, maximum: 100 },",
+              "    status: { enum: ['IDLE', 'BUSY'] }",
+              "  }",
+              "};",
+              "pm.test('200', () => pm.response.to.have.status(200));",
+              "pm.test('esquema del robot', () => pm.response.to.have.jsonSchema(robotSchema));"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "Robot inexistente (404)",
+      "request": {
+        "method": "GET",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "url": {
+          "raw": "{{host}}/api/robots/9999",
+          "host": [
+            "{{host}}"
+          ],
+          "path": [
+            "api",
+            "robots",
+            "9999"
+          ]
+        }
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('404', () => pm.response.to.have.status(404));"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "Pedido inválido (400)",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "url": {
+          "raw": "{{host}}/api/orders",
+          "host": [
+            "{{host}}"
+          ],
+          "path": [
+            "api",
+            "orders"
+          ]
+        },
+        "body": {
+          "mode": "raw",
+          "raw": "{\"customer\": \"\", \"destX\": -1, \"destY\": 5}"
+        }
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('400', () => pm.response.to.have.status(400));"
             ]
           }
         }
@@ -305,7 +557,7 @@
           "script": {
             "type": "text/javascript",
             "exec": [
-              "pm.test('200 o 409 sin AMR', () => pm.expect([200,409]).to.include(pm.response.code));"
+              "pm.test('200 o 409 sin AMR', () => pm.expect([200, 409]).to.include(pm.response.code));"
             ]
           }
         }
@@ -345,6 +597,113 @@
             "type": "text/javascript",
             "exec": [
               "pm.test('409', () => pm.response.to.have.status(409));"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "Crear pedido a borrar",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "url": {
+          "raw": "{{host}}/api/orders",
+          "host": [
+            "{{host}}"
+          ],
+          "path": [
+            "api",
+            "orders"
+          ]
+        },
+        "body": {
+          "mode": "raw",
+          "raw": "{\"customer\": \"Postman borrar\", \"destX\": 10, \"destY\": 5}"
+        }
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('201', () => pm.response.to.have.status(201));",
+              "pm.collectionVariables.set('tmpOrderId', pm.response.json().id);"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "Borrar pedido CREATED (204)",
+      "request": {
+        "method": "DELETE",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "url": {
+          "raw": "{{host}}/api/orders/{{tmpOrderId}}",
+          "host": [
+            "{{host}}"
+          ],
+          "path": [
+            "api",
+            "orders",
+            "{{tmpOrderId}}"
+          ]
+        }
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('204 No Content', () => pm.response.to.have.status(204));",
+              "pm.test('sin cuerpo', () => pm.expect(pm.response.text()).to.eql(''));"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "Pedido borrado ya no existe (404)",
+      "request": {
+        "method": "GET",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "url": {
+          "raw": "{{host}}/api/orders/{{tmpOrderId}}",
+          "host": [
+            "{{host}}"
+          ],
+          "path": [
+            "api",
+            "orders",
+            "{{tmpOrderId}}"
+          ]
+        }
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('404', () => pm.response.to.have.status(404));"
             ]
           }
         }

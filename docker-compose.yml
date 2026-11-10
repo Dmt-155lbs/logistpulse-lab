@@ -62,6 +62,15 @@ services:
       LAB_MESSAGING_CONSUMER_ENABLED: ${LAB_MESSAGING_CONSUMER_ENABLED:-true}
     ports:
       - "8080:8080"
+    # La imagen es un JRE: el healthcheck usa wget (viene en eclipse-temurin:21-jre) contra el grupo "readiness" de
+    # Actuator, que NO depende de RabbitMQ/Redis (con ellos caidos la API sigue sirviendo y no debe marcarse unhealthy).
+    # --spider: sin descargar el cuerpo; wget sale con codigo != 0 si la respuesta no es 2xx.
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:8080/actuator/health/readiness"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 40s
 
   prometheus:
     image: prom/prometheus:v3.0.1
@@ -71,7 +80,8 @@ services:
     ports:
       - "9090:9090"
     depends_on:
-      - api
+      api:
+        condition: service_healthy
 
   grafana:
     image: grafana/grafana:11.4.0

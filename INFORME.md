@@ -487,7 +487,7 @@ Dos conclusiones: (1) con Redis o la BD caídos la API fallaba de forma poco ele
 | `stop db` | 500 HTML a los 28,9 s; `/actuator/prometheus` >10 s, `up=0` | dispatch y listado **503 JSON** `{"error":"Servicio temporalmente no disponible; reintenta en unos segundos","status":503}` con `Retry-After: 2` en **1,9 s**; health 503 en 1,94 s; `/actuator/prometheus` **200** (3,9 s la primera vez, 22 ms después) y `up=1`; health UP a los 5 s de `start` |
 | `stop rabbitmq` | 1.ª llamada de health >30 s | 1.ª llamada de health 4,5 s, luego 11-14 ms; `GET /actuator/health/liveness` 200 en 10 ms; dispatch 200 en 0,16 s |
 
-Observación de diseño: con Rabbit o Redis caídos `/actuator/health` (agregado) devuelve 503 aunque la API siga sirviendo; por eso en la Parte 9.4 el *healthcheck* usa `/actuator/health/liveness`. No verifiqué el comportamiento del grupo `readiness` ante estas caídas (solo vi `readinessState: UP`).
+Observación de diseño: con Rabbit o Redis caídos `/actuator/health` (agregado) devuelve 503 aunque la API siga sirviendo; por eso en la Parte 9.4 el *healthcheck* usa `/actuator/health/readiness`. Verificado con RabbitMQ y Redis parados: `/actuator/health` 503 (2,4 s), `/actuator/health/liveness` 200 (7 ms) y `/actuator/health/readiness` 200 (6 ms).
 
 ### 8.4 Latencia p95
 Consulta del panel «Latencia p95 por endpoint (s)» (excluye `/actuator`):
@@ -512,3 +512,98 @@ Valores reales sobre los últimos 30 min de la sesión (incluyen las caídas pro
 - **Provocada:** cargué AMR-05 (100 %) y despaché hasta que `logistpulse_robots_idle` fue 0 (los siguientes dispatch daban 409). La alerta pasó a `pending` con `activeAt 00:27:44` y a **`firing` unos 66 s después** (`/api/v1/alerts`: `SinAmrLibres firing ... "No quedan AMR libres"`; también `ALERTS{alertname="SinAmrLibres",alertstate="firing"} = 1`). Al marcar un pedido `DELIVERED` (libera un AMR) volvió a `inactive` en unos 12 s. No hay Alertmanager en el stack: la alerta se ve en Prometheus pero no se notifica a nadie.
 
 `./mvnw -q test` (sin Docker) -> 70 tests, 0 fallos.
+
+## Parte 9 · Pruebas y contenedores
+
+### Qué se implementó
+- `postman/logistpulse.postman_collection.json`: tests con esquema, `Location` y estado; peticiones nuevas para los endpoints de la Parte 1 (GET pedido, GET robot, DELETE) y casos de error.
+- `OrderServiceDispatchTest`: un test más (ver 9.2).
+- `docker-compose.yml`: `healthcheck` del servicio `api`; `prometheus` pasa a depender de `api: condition: service_healthy`.
+
+### 9.1 Colección de Postman con newman
+No hay Postman (GUI) en el entorno; usé **newman** (`npx newman run postman/logistpulse.postman_collection.json`), que ejecuta la misma colección que el *Runner*. **Línea base** (colección original, pila recién levantada): 9 peticiones, 8 aserciones, 0 fallos.
+
+Los tres tests pedidos están en «Crear pedido» (`POST /api/orders`):
+```js
+pm.test('201 Created', () => pm.response.to.have.status(201));                       // 1) código de estado
+pm.test('Location termina en /api/orders/{id}', () => {                              // 2) cabecera Location
+  const loc = pm.response.headers.get('Location');
+  pm.expect(loc).to.match(/\/api\/orders\/\d+$/);
+  pm.expect(loc.split('/').pop()).to.equal(String(pm.response.json().id));
+});
+pm.test('esquema del pedido', () => pm.response.to.have.jsonSchema(orderSchema));    // 3) esquema (required + tipos + enum de status)
+```
+`orderSchema` exige `id, code, customer, destX, destY, status, warehouse, createdAt, links`, con `status` dentro del enum de la máquina de estados y `robot`/`etaMinutes` nulos o del tipo correcto. Además: esquema de robot en `GET /api/robots/1`, esquema de pedido en `GET /api/orders/{id}`, y casos nuevos: pedido inexistente 404, robot inexistente 404, pedido inválido 400, `DELETE` de un pedido `CREATED` creado a propósito (204 sin cuerpo y luego 404 al consultarlo).
+
+**Ejecución real** (pila limpia, `docker compose down -v` + `up -d --build`), resumen de newman:
+```
+requests         17 ejecutadas, 0 fallidas
+test-scripts     16 ejecutados, 0 fallidos
+assertions       24 ejecutadas, 0 fallidas
+average response time: 75ms [min: 7ms, max: 456ms]
+```
+Despacho de la colección en la pila limpia: `POST /api/orders/4/dispatch [200 OK]`. Con la BD ya usada (flota agotada) esa misma petición devuelve 409, que el test acepta («200 o 409 sin AMR»): lo comprobé en una ejecución previa (17 peticiones, 24 aserciones, 0 fallos con 409).
+**Control negativo**: para comprobar que el test de esquema no pasa siempre, ejecuté una copia con un campo requerido inexistente (`campoInventado`): fallaron las 2 aserciones «esquema del pedido» (24 ejecutadas, 2 fallidas) y las demás siguieron en verde.
+
+### 9.2 Test de Mockito para `OrderService.dispatch`
+Revisé `OrderServiceDispatchTest` (Parte 6) y **ya cubría** los tres casos pedidos; no los dupliqué:
+| Requisito | Test existente |
+|---|---|
+| sin robots → 409 | `sinRobotsLibresDevuelve409YNoLlamaAlTransportista` (comprueba además que no se llama al transportista ni se escribe en el outbox) |
+| pedido ya despachado → 409 | `pedidoYaDespachadoDevuelve409YNoLlamaAlTransportista` |
+| ETA caído → `route.cost()*2` | `conElTransportistaCaidoUsaCostoPorDos` (costo 9 → 18) |
+
+Lo que faltaba: ese último test usa un único costo, así que no distinguía «costo×2» de una constante. Añadí `elEtaDeContingenciaEsElCostoDeLaRutaPorDosNoUnaConstante` (costo 4 → ETA 8). Todo el suite se ejecuta con `./mvnw test` sin Docker.
+
+### 9.3 ★ El `Dockerfile`
+- **¿Por qué dos etapas?** La etapa `build` (`maven:3.9-eclipse-temurin-21`) necesita Maven, el JDK completo, el código fuente y la caché `~/.m2` solo para compilar; la etapa final (`eclipse-temurin:21-jre`) únicamente necesita un JRE y el `app.jar`. `COPY --from=build` lleva solo el jar. Resultado: imagen más pequeña (menos que descargar y almacenar), sin compiladores ni fuentes en producción (menos superficie de ataque) y arranque de contenedores más rápido. Medido con `docker images`: la imagen de la etapa `build` (`docker build --target build`) pesa **1,25 GB** (la base de Maven sola, 814 MB) y la imagen final `logistpulse-lab-api` **608 MB**, de los cuales **79,6 MB** son el jar (`docker history`).
+- **¿Qué cachea `dependency:go-offline`?** Descarga en `~/.m2` todas las dependencias y plugins que declara el `pom.xml` en una capa que solo depende de `pom.xml` (se copia **antes** que `src`). Mientras el `pom` no cambie, Docker reutiliza esa capa y las recompilaciones no descargan nada de Maven Central. Comprobado: con un cambio en `LabApplication.java` y `docker build --target build`, los pasos `WORKDIR`, `COPY pom.xml` y `RUN mvn dependency:go-offline` salieron `CACHED` y solo se rehicieron `COPY src` y `mvn package` (6,2 s). (Razonado: `go-offline` no siempre resuelve el 100 % de los plugins, algunos se descargan durante `package`; en este proyecto la reconstrucción fue de 6 s con la capa cacheada.)
+- **¿Por qué `USER appuser`?** Mínimo privilegio: por defecto un contenedor corre como `root` y, si se explota una vulnerabilidad de la aplicación, el atacante tendría root dentro del contenedor (más fácil escribir en el sistema de archivos, instalar herramientas o intentar escapar al host). `useradd --system --no-create-home` crea un usuario sin shell de login ni home; la app solo necesita escuchar en el puerto 8080 (>1024, no requiere root). Verificado: `docker run --entrypoint sh ... id` → `uid=999(appuser)`, y `/app/app.jar` pertenece a `root` con permisos `rw-r--r--`, de modo que la propia aplicación no puede modificar su jar.
+
+### 9.4 Reto: `healthcheck` del servicio `api` sin `curl`
+Opciones consideradas:
+1. **`wget --spider`** (elegida). Comprobé que `wget` existe en la imagen (`/usr/bin/wget`). Nota: en esta imagen concreta (`eclipse-temurin:21-jre`, base Ubuntu) **también existe `curl`** (`/usr/bin/curl`), al contrario de lo que afirma el enunciado; es un detalle de la variante de la imagen y puede cambiar (en una `-alpine` o en una imagen *distroless* no estaría), por lo que se documenta y no se depende de ello sin comprobarlo. `wget --spider` sale con código distinto de 0 si la respuesta no es 2xx.
+2. **bash `/dev/tcp`**: también funciona aquí (`exec 3<>/dev/tcp/localhost/8080; printf 'GET /actuator/health/readiness HTTP/1.0\r\n\r\n' >&3; head -1 <&3` devolvió `HTTP/1.1 200`) y sirve en cualquier imagen con bash, pero hay que interpretar la línea de estado a mano.
+3. **Programa Java de un solo archivo con `HttpClient`**: independiente de la imagen, pero lanza una JVM en cada comprobación (cientos de ms de CPU cada 10 s) y añade un archivo a mantener.
+
+```yaml
+healthcheck:
+  test: ["CMD", "wget", "-q", "--spider", "http://localhost:8080/actuator/health/readiness"]
+  interval: 10s
+  timeout: 3s
+  retries: 5
+  start_period: 40s
+```
+**¿Por qué `readiness` y no `/actuator/health`?** Lo medido en la Parte 8: con RabbitMQ o Redis parados el agregado `/actuator/health` responde 503, pero la API sigue sirviendo; si el healthcheck lo usara, Docker marcaría la API `unhealthy` por un fallo de una dependencia que la API ya sabe degradar. Los grupos `liveness` y `readiness` no incluyen esos indicadores: respondieron 200 en 7 y 6 ms con ambos servicios parados.
+
+**Verificación** (`docker compose down -v && docker compose up -d --build`, 31 s en total):
+```
+SERVICE        STATUS
+api            Up 13 seconds (healthy)
+db / redis / rabbitmq / carrier-mock   (healthy)
+```
+`docker inspect` muestra el historial: la primera comprobación (durante el `start_period`) con `ExitCode 4` (wget: respuesta de error del servidor mientras arrancaba) y la siguiente con `ExitCode 0`.
+**Dependencias:** `prometheus` ahora usa `depends_on: api: condition: service_healthy`, así empieza a hacer *scrape* solo cuando la API está lista, y no registra una racha inicial de `up=0` mientras arranca (`grafana` ya depende de `prometheus`). Contrapartida: si la API nunca llega a `healthy` (p. ej. un error de arranque), Prometheus y Grafana no arrancan y no se pueden usar para diagnosticarlo; para este laboratorio compensa el arranque ordenado.
+
+`./mvnw -q test` (sin Docker) -> 71 tests, 0 fallos.
+
+## Resumen
+
+| Parte | Estado | Commit / archivos principales |
+|---|---|---|
+| 0 Recorrido | hecha | `590f01a`; `INFORME.md`, `scripts/smoke.sh` |
+| 1 Jersey | hecha | `0f86a73`; `RobotResource`, `OrderResource` (DELETE), `ConstraintViolationMapper` |
+| 2 JPA | hecha | `6deebbe`; índice `idx_orders_status`, experimento N+1 |
+| 3 Spring Data / HATEOAS | hecha | `1503d55`; `OrderSorting`, enlaces de paginación |
+| 4 Concurrencia | hecha | `cb78c9e`; `RETURNED`, `@Version`, `scripts/race.py` |
+| 5 Rutas A* y Redis | hecha | `26cf20a`; costo 2, diagonales, `RoutePlanner` con versión del plano |
+| 6 RestClient | hecha | `c998c31`; `CarrierClient`, `OrderService.dispatch` con `TransactionTemplate` |
+| 7 Outbox | hecha | `702a8e6`; `outbox/*`, `DispatchedEventHandler` |
+| 8 Observabilidad y caos | hecha | `de21348`; `JerseyConfig`, `OrderMetrics`, `infra/prometheus/rules.yml`, dashboard, `ServiceUnavailableMapper` |
+| 9 Pruebas y contenedores | hecha | commit «Parte 9: ...» (último en `git log`); colección Postman, `docker-compose.yml`, `OrderServiceDispatchTest` |
+
+### Cómo ejecutar
+- **Modo A (sin Docker):** `./mvnw spring-boot:run` (Windows: `.\mvnw.cmd spring-boot:run`) y abrir `http://localhost:8080`.
+- **Modo B (stack completo):** `docker compose up -d --build`, `docker compose ps` hasta ver todo `healthy`; Grafana en `:3000`, Prometheus en `:9090` (alertas en `/alerts`), RabbitMQ en `:15672`. Para parar: `docker compose stop` (o `down -v` para descartar la BD).
+- **Pruebas unitarias:** `./mvnw test` (no necesita Docker).
+- **Colección de Postman:** con la API arriba, `npx newman run postman/logistpulse.postman_collection.json`.

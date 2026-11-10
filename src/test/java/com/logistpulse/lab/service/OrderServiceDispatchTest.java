@@ -95,6 +95,16 @@ class OrderServiceDispatchTest {
     }
 
     @Test
+    void elEtaDeContingenciaEsElCostoDeLaRutaPorDosNoUnaConstante() {
+        when(carrier.etaMinutes(anyString())).thenReturn(Optional.empty());
+        when(planner.plan(any(Point.class), any(Point.class))).thenReturn(new RouteDto(List.of(), 4, 4));
+
+        var dto = service.dispatch(7L);
+
+        assertThat(dto.etaMinutes()).isEqualTo(8);    // 4 * 2
+    }
+
+    @Test
     void sinRobotsLibresDevuelve409YNoLlamaAlTransportista() {
         when(robots.findByStatusAndBatteryGreaterThanEqualOrderByIdAsc(RobotStatus.IDLE, OrderService.MIN_BATTERY))
                 .thenReturn(List.of());
